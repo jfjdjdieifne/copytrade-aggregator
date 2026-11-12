@@ -57,12 +57,24 @@ class Telegram:
                 },
             )
             status = getattr(resp, "status", 200)
-            if status != 200:
-                return {"ok": False, "error": f"HTTP {status}"}
             data = resp.json()
             if hasattr(data, "__await__"):
                 data = await data
-            return data if isinstance(data, dict) else {"ok": True}
+            if not isinstance(data, dict):
+                return {"ok": status == 200, "error": "" if status == 200 else f"HTTP {status}"}
+
+            if status != 200:
+                # Telegram's `description` says exactly why: "chat not found",
+                # "bot was blocked by the user", "message is too long". Collapsing
+                # that into "HTTP 400" throws away the only useful part.
+                description = str(data.get("description", "") or "")
+                return {
+                    "ok": False,
+                    "error": f"HTTP {status}" + (f": {description}" if description else ""),
+                    "description": description,
+                    "error_code": data.get("error_code", status),
+                }
+            return data
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:200]}
 
