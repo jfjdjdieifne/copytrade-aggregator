@@ -646,15 +646,163 @@ async def test_handle_never_raises_even_when_the_store_explodes():
     assert result[1]["status"] == 500
 
 
-def test_store_falls_back_when_binding_is_an_opaque_object():
-    """A stub-shaped object that cannot serve RPC must not take the Worker down."""
-    from cta.state import MemoryStore, store_from_env
+def test_a_configured_but_broken_binding_is_reported_not_swapped_for_memory():
+    """Silently substituting MemoryStore made the live dashboard invent zeros.
+
+    An unbound binding means "not configured" and legitimately falls back to
+    memory. A *configured* binding that cannot be used is a bug, and hiding it
+    behind an empty in-memory store produced a page reporting "0 signals, 0
+    traders, platforms unreachable" as though those were measurements.
+    """
+    from cta.state import MemoryStore, UnavailableStore, store_from_env
 
     class Opaque:
-        """Answers every attribute, like a JS proxy, but defines no methods."""
+        """Not a store, no idFromName, cannot serve RPC."""
 
     store = store_from_env(FakeEnv(STATE=Opaque()))
-    assert isinstance(store, MemoryStore)
+    assert isinstance(store, UnavailableStore)
+    assert not isinstance(store, MemoryStore)
+
+
+async def test_an_unavailable_store_raises_instead_of_answering_empty():
+    import pytest
+
+    from cta.state import StoreError, UnavailableStore
+
+    store = UnavailableStore("test")
+    with pytest.raises(StoreError):
+        await store.get("watchlist")
+    with pytest.raises(StoreError):
+        await store.set("watchlist", [])
+
+
+def test_unbound_state_still_falls_back_to_memory():
+    """No binding at all is the legitimate local/preview case."""
+    from cta.state import MemoryStore, store_from_env
+
+    assert isinstance(store_from_env(FakeEnv(STATE=None)), MemoryStore)
+    assert isinstance(store_from_env(FakeEnv(STATE="")), MemoryStore)
+
+
+# ── the namespace the runtime actually hands us ─────────────────────────────
+class _FetcherWrapper:
+    """Verbatim shape from workers-runtime-sdk `rpc.py`: forwards to a stub."""
+
+    def __init__(self, binding):
+        self._binding = binding
+
+    def __getattr__(self, name):
+        attr = getattr(self._binding, name)
+        if not callable(attr):
+            return attr
+
+        async def wrapper(*args, **kwargs):
+            result = attr(*args, **kwargs)
+            if hasattr(result, "then") or hasattr(result, "__await__"):
+                result = await result
+            return result
+
+        return wrapper
+
+
+class _DurableObjectNamespaceWrapper:
+    """Also verbatim: `get()` returns a FetcherWrapper, and it has NO storage_get.
+
+    `__getattr__` forwards to the JS namespace, so a `storage_get` call lands on
+    an object that does not have it and raises — the live failure.
+    """
+
+    def __init__(self, binding):
+        self._binding = binding
+
+    def __getattr__(self, name):
+        return getattr(self._binding, name)
+
+    def get(self, *args, **kwargs):
+        return _FetcherWrapper(self._binding.get(*args, **kwargs))
+
+
+class _JsStub:
+    def __init__(self):
+        self.data = {}
+
+    async def storage_get(self, key):
+        return self.data.get(key)
+
+    async def storage_set(self, key, value):
+        self.data[key] = value
+
+    async def storage_append(self, key, item, cap=500):
+        self.data.setdefault(key, []).append(item)
+        return self.data[key]
+
+    async def storage_delete(self, key):
+        self.data.pop(key, None)
+
+
+class _JsNamespace:
+    def __init__(self):
+        self.stub = _JsStub()
+        self.requested = []
+
+    def idFromName(self, name):
+        self.requested.append(name)
+        return f"id-{name}"
+
+    def get(self, do_id):
+        assert do_id.startswith("id-"), "get() must be called with an idFromName result"
+        return self.stub
+
+
+async def test_namespace_is_resolved_to_a_stub_and_state_actually_persists():
+    """The live bug: DurableStore was handed the namespace, not a stub.
+
+    Calling storage_get on the namespace raised, DurableStore swallowed it, and
+    every read returned its default — so state looked empty, not broken.
+    """
+    from cta.state import DO_INSTANCE_NAME, DurableStore, store_from_env
+
+    ns = _JsNamespace()
+    env = FakeEnv(STATE=_DurableObjectNamespaceWrapper(ns))
+
+    store = store_from_env(env)
+    assert isinstance(store, DurableStore)
+    assert ns.requested == [DO_INSTANCE_NAME]
+
+    await store.set("counters", {"cycles": 7})
+    assert await store.get("counters") == {"cycles": 7}
+    assert ns.stub.data["counters"] == '{"cycles": 7}'
+
+
+async def test_a_real_stub_passed_directly_is_still_used():
+    """Some paths receive the stub already; do not double-wrap or reject it."""
+    from cta.state import DurableStore, store_from_env
+
+    stub = _JsStub()
+    store = store_from_env(FakeEnv(STATE=stub))
+    assert isinstance(store, DurableStore)
+    await store.set("k", 1)
+    assert await store.get("k") == 1
+
+
+async def test_durable_store_does_not_swallow_rpc_failures():
+    """A failure must raise, not look like an empty database."""
+    import pytest
+
+    from cta.state import DurableStore, StoreError
+
+    class BrokenStub:
+        def storage_get(self, key):
+            raise RuntimeError("durable object is asleep")
+
+    with pytest.raises(RuntimeError):
+        await DurableStore(BrokenStub()).get("x")
+
+    class MissingMethod:
+        pass
+
+    with pytest.raises(StoreError):
+        await DurableStore(MissingMethod()).get("x")
 
 
 # ── http bridge: tuples must become servable Responses ──────────────────────
@@ -823,3 +971,192 @@ def test_bridge_matches_the_real_sdk_response_signature(monkeypatch):
     assert isinstance(crashed, StrictResponse)
     assert crashed.status == 500
     assert len(built) == len(cases) + 1
+
+
+# ── setup diagnostics: make "the bot is silent" answerable ──────────────────
+class _TGDiagFetch:
+    """A Telegram that answers getMe / setWebhook / getWebhookInfo."""
+
+    def __init__(self, token_valid=True, username="MyRadarBot", pending=0):
+        self.token_valid = token_valid
+        self.username = username
+        self.pending = pending
+        self.calls = []
+
+    async def __call__(self, url, *args, **kwargs):
+        method = url.rsplit("/", 1)[-1]
+        self.calls.append(method)
+
+        class R:
+            def __init__(self, payload):
+                self._p = payload
+
+            async def json(self):
+                return self._p
+
+            async def text(self):
+                return json.dumps(self._p)
+
+        if method == "getMe":
+            if not self.token_valid:
+                return R({"ok": False, "error_code": 401,
+                          "description": "Unauthorized"})
+            return R({"ok": True, "result": {"id": 123456, "is_bot": True,
+                                             "username": self.username}})
+        if method == "setWebhook":
+            return R({"ok": True, "result": True, "description": "Webhook was set"})
+        if method == "getWebhookInfo":
+            return R({"ok": True, "result": {
+                "url": "https://w.dev/telegram",
+                "pending_update_count": self.pending,
+            }})
+        return R({"ok": True, "result": True})
+
+
+async def test_setup_reports_the_bot_username_so_you_know_which_bot_to_open():
+    """A token from the wrong bot registers a webhook nobody watches."""
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="123:abc", WORKER_URL="https://w.dev")
+    resp = await handle(
+        FakeRequest("https://w.dev/setup.json"), env,
+        fetch=_TGDiagFetch(username="MyRadarBot"),
+    )
+    body = _body(resp)
+    assert body["token_ok"] is True
+    assert body["bot_username"] == "MyRadarBot"
+    assert body["expected_url"] == "https://w.dev/telegram"
+
+
+async def test_setup_names_a_rejected_token_instead_of_failing_vaguely():
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="bad:token", WORKER_URL="https://w.dev")
+    resp = await handle(
+        FakeRequest("https://w.dev/setup.json"), env,
+        fetch=_TGDiagFetch(token_valid=False),
+    )
+    body = _body(resp)
+    assert body["token_ok"] is False
+    assert "nauthor" in body["token_error"]  # Unauthorized
+
+
+async def test_setup_page_warns_about_updates_telegram_could_not_deliver():
+    """pending_update_count > 0 means registered-but-not-delivering."""
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="123:abc", WORKER_URL="https://w.dev")
+    raw = await handle(
+        FakeRequest("https://w.dev/setup"), env,
+        fetch=_TGDiagFetch(pending=4),
+    )
+    html, headers = raw
+    assert "لم تُعالَج" in html
+    assert "4" in html
+
+
+async def test_setup_page_names_the_bot():
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="123:abc", WORKER_URL="https://w.dev")
+    html, _ = await handle(
+        FakeRequest("https://w.dev/setup"), env,
+        fetch=_TGDiagFetch(username="MyRadarBot"),
+    )
+    assert "@MyRadarBot" in html
+
+
+# ── the dashboard must not print zeros it did not measure ───────────────────
+async def test_dashboard_refuses_to_show_zeros_when_state_is_unreadable():
+    from cta.state import UnavailableStore
+    from cta.worker import handle
+
+    env = _env()
+    env.STATE = UnavailableStore("namespace-without-storage")
+    html, headers = await handle(
+        FakeRequest("https://w.dev/dash"), env, fetch=FakeFetch({})
+    )
+    assert headers["status"] == 200
+    assert "الذاكرة غير متاحة" in html
+    # The tell that a stale deployment shows: a confident row of zeros.
+    assert "قائمة المراقبة" not in html
+
+
+async def test_health_reports_state_failure_rather_than_ok_true():
+    from cta.state import UnavailableStore
+    from cta.worker import handle
+
+    env = _env()
+    env.STATE = UnavailableStore("broken")
+    body = _body(await handle(FakeRequest("https://w.dev/health"), env, fetch=FakeFetch({})))
+    assert body["ok"] is False
+
+
+def test_default_fetch_prefers_the_sdk_fetch_which_converts_the_options_dict():
+    """`js.fetch(url, python_dict)` silently drops the method and body.
+
+    A Python dict reaches JS as a proxy, so `new Request(url, init)` sees
+    `init.method === undefined` and the call becomes a bodyless GET. The SDK's
+    own fetch does `to_js(kwargs, dict_converter=Object.fromEntries)` first,
+    which is why every network call in cta must go through it.
+    """
+    import sys
+    import types
+
+    from cta.worker import _default_fetch
+
+    sentinel = object()
+
+    class FakeEnv:
+        pass
+
+    fake = types.ModuleType("workers")
+    fake.fetch = sentinel
+    monkeypatch_target = sys.modules.get("workers")
+    sys.modules["workers"] = fake
+    try:
+        assert _default_fetch(FakeEnv()) is sentinel
+    finally:
+        if monkeypatch_target is None:
+            sys.modules.pop("workers", None)
+        else:
+            sys.modules["workers"] = monkeypatch_target
+
+
+def test_default_fetch_honours_an_injected_fetch_first():
+    """Tests and the preview server inject their own; never shadow it."""
+    from cta.worker import _default_fetch
+
+    async def injected(url, *a, **k):
+        return None
+
+    env = type("Env", (), {})()
+    env.fetch = injected  # instance attribute: no descriptor binding
+    assert _default_fetch(env) is injected
+
+
+async def test_telegram_posts_a_json_body_and_method():
+    """Guard the call shape the SDK expects: (url, init-dict)."""
+    calls = []
+
+    async def fake_fetch(url, init=None, **kwargs):
+        calls.append((url, init))
+
+        class R:
+            status = 200
+
+            async def json(self):
+                return {"ok": True, "result": {"message_id": 1}}
+
+        return R()
+
+    from cta.telegram import Telegram
+
+    tg = Telegram(fake_fetch, "123:abc")
+    await tg.send("hello", "999")
+
+    url, init = calls[0]
+    assert url.endswith("/sendMessage")
+    assert init["method"] == "POST"
+    assert "\"chat_id\": \"999\"" in init["body"] or '"chat_id": "999"' in init["body"]
+    assert init["headers"]["content-type"] == "application/json"

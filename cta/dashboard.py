@@ -206,6 +206,7 @@ h1{{font-size:19px;margin:0 0 4px;font-weight:700}}
 header.top{{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:12px}}
 .banner{{border-radius:12px;padding:11px 13px;font-size:13px;margin-bottom:14px;line-height:1.6}}
 .banner.demo{{background:#2a2113;border:1px solid #5c4a1d;color:#f2cf72}}
+.card.bad{{background:#2a1313;border:1px solid #6b2525;color:#ffb4b4;padding:12px;border-radius:10px;margin:12px 0}}
 .banner.live{{background:#0f2417;border:1px solid #1e4d2b;color:#63e6a0}}
 .pills{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}}
 .links{{background:var(--card);border:1px solid var(--line);border-radius:12px;
@@ -348,6 +349,11 @@ pre{background:#0f141a;border-radius:8px;padding:10px;overflow-x:auto;
 """
 
 
+def _open_instruction(bot_username: str) -> str:
+    who = "@" + html.escape(bot_username) if bot_username else "اسم بوتك"
+    return f"افتح تلغرام وابحث عن <b>{who}</b>، ثم أرسل:"
+
+
 def render_setup_page(
     *,
     ok: bool,
@@ -359,6 +365,10 @@ def render_setup_page(
     telegram_said: str = "",
     last_error: str = "",
     missing: str = "",
+    bot_username: str = "",
+    token_ok: bool = True,
+    token_error: str = "",
+    pending_updates: int = 0,
 ) -> str:
     """Human-readable first-run page.
 
@@ -374,11 +384,20 @@ def render_setup_page(
             "أضفه في Settings ← Variables and Secrets ثم أعد النشر، "
             "وبعدها أعد تحميل هذه الصفحة.</div>"
         )
+    elif not token_ok:
+        hero = (
+            '<div class="hero bad"><b>⚠️ التوكن غير صالح</b>'
+            f"تلغرام رفض التوكن: <code>{html.escape(token_error or 'unauthorized')}</code><br>"
+            "تأكد أنك نسخت <b>التوكن كاملاً</b> من @BotFather (يبدأ بأرقام ثم نقطتين). "
+            "إن كنت ألغيت التوكن سابقاً (Revoke) فالتوكن القديم لم يعد يعمل — "
+            "خُذ الجديد من @BotFather ← /mybots ← الاختيار ← API Token.</div>"
+        )
     elif ok:
+        who = f"@{html.escape(bot_username)}" if bot_username else "بوتك"
         hero = (
             '<div class="hero good"><b>✅ تم الربط بنجاح</b>'
-            "تلغرام صار يعرف عنوان الـ Worker. الخطوة الوحيدة الباقية: "
-            "افتح بوتك وأرسل <b>/help</b>.</div>"
+            f"التوكن صالح وهو لبوت <b>{who}</b>. تلغرام صار يعرف عنوان الـ Worker. "
+            f"الخطوة الوحيدة الباقية: افتح <b>{who}</b> في تلغرام وأرسل <b>/help</b>.</div>"
         )
     else:
         hero = (
@@ -420,10 +439,18 @@ def render_setup_page(
         step(
             "todo",
             "جرّب البوت — الآن",
-            "افتح تلغرام، ابحث عن بوتك، وأرسل:",
+            _open_instruction(bot_username),
             "/help",
         ),
     ]
+
+    if pending_updates and ok:
+        hero += (
+            '<div class="hero bad" style="margin-top:10px"><b>⚠️ رسائل لم تُعالَج</b>'
+            f"تلغرام يقول إن عنده <b>{pending_updates}</b> تحديثاً لم يستلمه الـ Worker. "
+            "هذا يعني أن الربط مسجَّل لكن الرسائل لا تصل. أعد تحميل هذه الصفحة، "
+            "وإن بقي الرقم ثابتاً فأرسل لي هذا الرقم.</div>"
+        )
 
     diag = ""
     if last_error or telegram_said or not ok:
@@ -464,6 +491,46 @@ def render_setup_page(
   رابط الـ Worker:<br>
   <code style="font-size:11px">{html.escape(worker_url)}</code><br>
   HYPOTHETICAL_ — تحليل آلي، ليس نصيحة مالية.
+</div>
+</body>
+</html>"""
+
+
+def render_state_error(reason: str, base_url: str = "") -> str:
+    """Shown instead of the dashboard when state cannot be read.
+
+    The alternative — rendering an empty dashboard — is what made a broken
+    Durable Object look like a quiet market for a whole deployment: every number
+    was zero, and zero is a plausible reading of "no signal yet".
+    """
+    safe = html.escape(reason or "state backend unavailable")
+    setup = (
+        f'<p><a class="btn" href="{html.escape(base_url)}/setup">افتح الإعداد</a></p>'
+        if base_url
+        else ""
+    )
+    return f"""<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>الذاكرة غير متاحة</title>
+<style>{_SETUP_CSS}</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🔴 الذاكرة غير متاحة</h1>
+  <p>الموقع يعمل، لكنه <strong>لا يستطيع قراءة حالته المحفوظة</strong> — لذلك لن
+  يعرض أرقاماً. الأصفار التي كانت تُعرض سابقاً لم تكن قياساً، كانت غياب بيانات.</p>
+  <div class="card bad">
+    <strong>السبب:</strong>
+    <code style="direction:ltr;display:block;margin-top:8px">{safe}</code>
+  </div>
+  <h2>ما معنى هذا</h2>
+  <p>الـ Worker يصل إلى الإنترنت ويعمل، لكن ربط <code>STATE</code> (Durable Object)
+  لا يصل إليه بشكل قابل للاستخدام. هذا خلل في الكود أو في الربط، وليس في حسابك.</p>
+  {setup}
+  <p class="foot">HYPOTHETICAL_ — تحليل آلي، ليس نصيحة مالية.</p>
 </div>
 </body>
 </html>"""

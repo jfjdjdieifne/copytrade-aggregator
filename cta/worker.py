@@ -27,7 +27,7 @@ from .runtime import (
     run_profile_async,
     track_outcomes_async,
 )
-from .dashboard import render_dashboard, render_setup_page
+from .dashboard import render_dashboard, render_setup_page, render_state_error
 from .telegram import Telegram
 from .state import get_signals, get_watchlist, store_from_env
 
@@ -131,10 +131,35 @@ def _default_fetch(env):
         injected = None
     if callable(injected):
         return injected
+    # Prefer the SDK's own fetch. It converts the options dict to a real JS
+    # object and wraps the reply in `Response`:
+    #
+    #     resp = await _pyfetch_patched(resource, **other_options)
+    #     return Response(resp.js_response)
+    #
+    # Calling `js.fetch(url, python_dict)` directly does NOT work: a Python dict
+    # reaches JavaScript as a proxy, `new Request(url, init)` reads `init.method`
+    # as undefined, and the request silently becomes a bodyless GET. Telegram's
+    # sendMessage then fails while getMe appears to succeed — a confusing split
+    # that looks like a broken bot rather than a broken call.
+    try:
+        from workers import fetch as sdk_fetch  # noqa: PLC0415 — runtime only
+
+        return sdk_fetch
+    except Exception:
+        pass
+
     try:
         import js  # noqa: PLC0415 — Cloudflare-only module
+        from js import Object  # noqa: PLC0415
+        from pyodide.ffi import to_js  # noqa: PLC0415
 
-        return js.fetch
+        async def _fetch(url, init=None, **options):
+            merged = dict(init or {})
+            merged.update(options)
+            return await js.fetch(url, to_js(merged, dict_converter=Object.fromEntries))
+
+        return _fetch
     except Exception:  # pragma: no cover - only hit outside Cloudflare
         return _unavailable_fetch
 
@@ -230,6 +255,11 @@ async def _dispatch(request, env, ctx, fetcher):
                 )
 
             tg = Telegram(fetcher, token)
+            # Which bot is this token actually for? Without asking, a token from
+            # a different bot silently registers a webhook nobody is watching,
+            # and "the bot does not answer" has a dozen indistinguishable causes.
+            me = await tg.call("getMe", {})
+            bot_info = me.get("result", {}) if me.get("ok") else {}
             hook = await tg.set_webhook(f"{base}/telegram", secret=secret)
             info = await tg.get_webhook_info()
             detail = info.get("result", {}) if info.get("ok") else {}
@@ -246,6 +276,10 @@ async def _dispatch(request, env, ctx, fetcher):
                 "pending_updates": detail.get("pending_update_count", 0),
                 "last_error": detail.get("last_error_message", ""),
                 "telegram_said": hook.get("description", ""),
+                "token_ok": bool(me.get("ok")),
+                "token_error": "" if me.get("ok") else str(me.get("description", me.get("error", "")))[:200],
+                "bot_username": bot_info.get("username", ""),
+                "bot_id": bot_info.get("id", ""),
             }
 
             if path.endswith(".json"):
@@ -260,6 +294,10 @@ async def _dispatch(request, env, ctx, fetcher):
                     expected_url=result["expected_url"],
                     telegram_said=result["telegram_said"],
                     last_error=result["last_error"],
+                    bot_username=result["bot_username"],
+                    token_ok=result["token_ok"],
+                    token_error=result["token_error"],
+                    pending_updates=result["pending_updates"],
                 ),
                 {"status": 200 if result["ok"] else 502,
                  "content-type": "text/html; charset=utf-8"},
@@ -267,7 +305,13 @@ async def _dispatch(request, env, ctx, fetcher):
 
         if path in ("/", "/status", "/dash"):
             store = store_from_env(env)
-            html = await _dashboard_html(store, _configured_base(env) or _origin(request))
+            try:
+                html = await _dashboard_html(store, _configured_base(env) or _origin(request))
+            except Exception as exc:
+                # Never print zeros we did not measure. If state cannot be read,
+                # say that instead — an empty dashboard is indistinguishable from
+                # a broken one, and that ambiguity hid a real bug for a day.
+                html = render_state_error(str(exc)[:300], base_url=_configured_base(env) or _origin(request))
             return (html, {"status": 200, "content-type": "text/html; charset=utf-8"})
 
         if path == "/health":
