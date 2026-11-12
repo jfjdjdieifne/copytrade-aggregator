@@ -562,10 +562,40 @@ async def run_cycle(
 
     watchlist = await store.get(KEY_WATCHLIST, []) or []
     profiled = False
-    if not watchlist:
-        watchlist = await profile_watchlist(venues, store, cfg)
+
+    # Keep searching while the pass is unfinished, not only while the watchlist
+    # is empty.
+    #
+    # `if not watchlist` looks reasonable and is wrong: the moment twelve wallets
+    # passed, the search declared itself done and froze at 12 of 30. A watchlist
+    # that stops growing at the first success is not a search, it is a sample.
+    from .discovery_resume import needs_more_work as _needs_more_work
+
+    _progress = {}
+    try:
+        _progress = await store.get("discovery_progress", {}) or {}
+    except Exception:
+        _progress = {}
+
+    if not watchlist or _needs_more_work(_progress):
+        # This MUST be the resumable profiler.
+        #
+        # It used to call `profile_watchlist`, the un-budgeted original that
+        # fetched the ~39 MB / 47k-row leaderboard inline. That cannot finish
+        # inside the free plan's 10 ms CPU budget, so it died -- and because it
+        # died inside `run_cycle` rather than in `run_profile_async`, the
+        # discovery cursor was never written at all. `/health` therefore reported
+        # "لم تبدأ عملية انتقاء المتداولين بعد" next to a cycle counter that
+        # climbed forever (6, 13, 30, 85 in the operator's screenshots).
+        #
+        # The two paths had to agree. There is now exactly one way to discover,
+        # and it is the one that budgets, checkpoints, and resumes.
+        from .discovery_resume import describe
+
+        profile = await profile_watchlist_resumable(venues, store, cfg, now=now)
         profiled = True
-        watchlist = await store.get(KEY_WATCHLIST, []) or watchlist
+        watchlist = await store.get(KEY_WATCHLIST, []) or []
+        _ = describe(profile.get("progress", {}))
 
     signals, clusters = await scan(venues, store, cfg, now=now, watchlist=watchlist)
 

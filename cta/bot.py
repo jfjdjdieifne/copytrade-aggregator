@@ -279,6 +279,10 @@ class Bot:
             return await self.cmd_remove(arg), main_keyboard()
         if cmd == "seeds":
             return await self.cmd_seeds(), main_keyboard()
+        if cmd in ("paper", "account", "money", "profits"):
+            return await self.cmd_paper()
+        if cmd in ("resetpaper", "reset"):
+            return await self.cmd_reset_paper(), main_keyboard()
 
         return (
             f"أمر غير معروف: `{cmd}`\nاستخدم /help لعرض الأوامر المتاحة.",
@@ -305,6 +309,9 @@ class Bot:
             return await self.cmd_health()
         if data == "seeds":
             return await self.cmd_seeds()
+        if data == "paper":
+            text, _ = await self.cmd_paper()
+            return text
         return None
 
     # ── command implementations ─────────────────────────────────────────────
@@ -487,6 +494,73 @@ class Bot:
         if len(watchlist) > 12:
             lines.append(f"... و{len(watchlist) - 12} غيرهم")
         return "\n".join(lines), main_keyboard()
+
+    async def cmd_paper(self) -> tuple[str, Optional[list]]:
+        """The $100 account: what taking every signal would actually have made.
+
+        This is the answer to "will it make money", phrased as a balance rather
+        than a feeling. It is not a forecast: fees, funding and slippage are
+        absent and every one of them makes the real number worse.
+        """
+        from .paper import KEY_PAPER, empty_account, honest_verdict, summarize
+
+        account = await self.store.get(KEY_PAPER, None)
+        if not isinstance(account, dict):
+            account = empty_account(self.cfg.paper_start_balance)
+
+        s = summarize(account)
+
+        lines = [
+            "💰 *حساب تجريبي — كل التوصيات*",
+            "",
+            f"• البداية: ${s['start_balance']:.2f}",
+            f"• الرصيد الحالي: *${s['balance']:.2f}*",
+            f"• حقوق الملكية: ${s['equity']:.2f}",
+            f"• الربح/الخسارة: {s['pnl_usd']:+.2f}$ ({s['pnl_pct']:+.1f}%)",
+            "",
+            f"• صفقات مغلقة: {s['trades']} (ربح {s['wins']} · خسارة {s['losses']})",
+            f"• صفقات مفتوحة: {s['open']}",
+            f"• إشارات لم تُنفَّذ: {s['missed']}",
+        ]
+        if s["trades"]:
+            lines += [
+                "",
+                f"• نسبة النجاح: {s['win_rate']}%",
+                f"• متوسط R: {s['mean_r']:+.2f}",
+                f"• معامل الربح: {s['profit_factor']}",
+                f"• أقصى تراجع: ${s['max_drawdown_usd']} ({s['max_drawdown_pct']}%)",
+            ]
+
+        open_trades = account.get("open", []) or []
+        if open_trades:
+            lines += ["", "*مفتوحة الآن:*"]
+            for t in open_trades[:6]:
+                lines.append(
+                    f"  {t.get('coin')} {t.get('side')} · دخول {t.get('entry')} · "
+                    f"وقف {t.get('stop')}"
+                )
+
+        lines += [
+            "",
+            f"_{honest_verdict(s)}_",
+            "",
+            f"⚠️ {s['caveat']}",
+        ]
+        return "\n".join(lines), main_keyboard()
+
+    async def cmd_reset_paper(self) -> str:
+        """Start the $100 account over, deliberately and on the record."""
+        from .paper import KEY_PAPER, empty_account
+
+        account = empty_account(self.cfg.paper_start_balance)
+        await self.store.set(KEY_PAPER, account)
+        return (
+            "♻️ *أُعيد ضبط الحساب التجريبي*\n"
+            f"الرصيد: ${self.cfg.paper_start_balance:.2f}\n"
+            "المخاطرة لكل صفقة: "
+            f"{self.cfg.paper_risk_pct}%\n\n"
+            "_الصفقات السابقة مُسحت. التوصيات القادمة ستُسجَّل من جديد._"
+        )
 
     async def cmd_stats(self) -> tuple[str, Optional[list]]:
         stats = await self.store.get(KEY_STATS, {}) or {}

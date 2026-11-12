@@ -77,6 +77,35 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     for sig in signals:
         payload = sig.to_dict()
         await remember_signal(store, payload)
+
+    # ── paper account: take EVERY signal automatically ──────────────────────
+    # The operator asked for exactly this: record every signal whether or not
+    # they entered it, on a fixed $100 account, so the result is measurable
+    # rather than remembered. Doing it inside the cycle means no signal is ever
+    # missed because a notification failed.
+    try:
+        from .paper import empty_account, mark_to_market, open_trade, KEY_PAPER
+
+        paper = await store.get(KEY_PAPER, None)
+        if not isinstance(paper, dict):
+            paper = empty_account(cfg.paper_start_balance)
+
+        for sig in signals:
+            paper, _ = open_trade(
+                paper, sig.to_dict(), risk_pct=cfg.paper_risk_pct, now=_now()
+            )
+
+        # Mark everything to the prices we already fetched; no extra requests.
+        try:
+            hl = venues.get("hyperliquid")
+            prices = await hl.prices() if hl is not None else {}
+        except Exception:
+            prices = {}
+        paper = mark_to_market(paper, prices or {})
+        await store.set(KEY_PAPER, paper)
+    except Exception as exc:
+        # Never let bookkeeping break the cycle, but do record it.
+        print(f"[cta] paper account failed: {type(exc).__name__}: {exc}")
         if not cfg.dry_run and tg.configured:
             keyboard = signal_keyboard(sig.signal_id)
             result = await tg.send(narrate_signal(sig), keyboard=keyboard)
