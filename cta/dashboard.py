@@ -764,6 +764,25 @@ def render_proof(report: dict, base_url: str = "") -> str:
         detail = ""
         reason_html = ""
 
+    # The detector proof and the monitoring proof are different questions. A
+    # perfect detector over an empty watchlist watches nobody, and the operator
+    # asked specifically whether anyone is being watched.
+    discovery = report.get("discovery") or {}
+    if discovery.get("available"):
+        watched = discovery.get("watching", 0)
+        tone = "good" if watched else "warn"
+        watch_card = (
+            f'<div class="card {tone}"><b>هل نراقب أحداً فعلاً؟</b>'
+            f'<div>{html.escape(str(discovery.get("verdict", "")))}</div>'
+            f'<div class="small">{html.escape(str(discovery.get("line", "")))}</div>'
+            "</div>"
+        )
+    else:
+        watch_card = (
+            '<div class="card warn"><b>حالة المراقبة</b>'
+            f'<div class="small">{html.escape(str(discovery.get("reason", "غير متاحة")))}</div></div>'
+        )
+
     links = (
         f'<p><a class="btn" href="{html.escape(base_url)}/selftest">فحص النظام</a> '
         f'<a class="btn" href="{html.escape(base_url)}/dash">اللوحة</a></p>'
@@ -788,6 +807,7 @@ def render_proof(report: dict, base_url: str = "") -> str:
 <body>
 <h1>🔬 إثبات أن الكشف يعمل</h1>
 {hero}
+{watch_card}
 <div class="card">{body}</div>
 {detail}
 {reason_html}

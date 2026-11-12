@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from ..models import Fill, Position
-from .base import Fetcher, RateLimiter, http_json
+from .base import Fetcher, RateLimited, RateLimiter, http_json
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -130,7 +130,11 @@ class HyperliquidVenue:
     # ── fills: the expensive call, only when something moved ────────────────
     async def fills(self, wallet: str, limit: int = 2000) -> list[dict]:
         if not await self.limiter.acquire(self.cfg.hl_userfills_weight):
-            return []
+            # Returning [] here is what made the radar report "0 متداول" while
+            # everything looked healthy: after ~45 wallets the limiter refused
+            # every call and each refusal was recorded as "this wallet has no
+            # trades". A refusal is now an error the caller must handle.
+            raise RateLimited(self.limiter.refusal(self.cfg.hl_userfills_weight))
         data = await http_json(
             self.fetch,
             f"{self.cfg.hl_base_url}/info",

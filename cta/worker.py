@@ -484,6 +484,17 @@ async def _dispatch(request, env, ctx, fetcher):
 
         if path in ("/prove", "/proof", "/verify"):
             report = await self_check_async(env, fetcher)
+            # Attach the live monitoring state so the page answers both
+            # questions: "would a signal be seen?" and "is anyone watched?".
+            try:
+                from .health import discovery_proof_async
+
+                report["discovery"] = await discovery_proof_async(store_from_env(env))
+            except Exception as exc:
+                report["discovery"] = {
+                    "available": False,
+                    "reason": f"{type(exc).__name__}: {exc}"[:160],
+                }
             if path.endswith(".json") or "format=json" in str(getattr(request, "url", "")):
                 return _json(report)
             return (
@@ -526,6 +537,8 @@ async def _dispatch(request, env, ctx, fetcher):
                     "signals": counters.get("signals", 0),
                     "last_cycle_at": await store.get("last_cycle_at"),
                     "source_health": await store.get("source_health", {}),
+                    "discovery": await store.get("discovery_progress", {}) or {},
+                    "scan_rotation": await store.get("scan_rotation", {}) or {},
                     "telegram": await _poll_status_safe(env, fetcher),
                 }
             )
@@ -589,18 +602,39 @@ async def scheduled(env, ctx=None, fetch=None):
     except Exception:
         pass
 
-    # Cheap daily maintenance: rebuild the watchlist once a day.
+    # Discovery is a long-running search, not a daily rebuild.
+    #
+    # It used to run once a day, which was fine when it tried (and failed) to do
+    # everything in one invocation. Now that it advances one affordable slice per
+    # run, once a day would score 12 wallets and give up until tomorrow: a
+    # 300-candidate pass would take 25 days. Every cron tick advances the search
+    # until a pass completes, then it idles until the next day.
     try:
         store = store_from_env(env)
+        from .discovery_resume import describe, load_progress, needs_more_work
+
+        progress = await load_progress(store)
+        unfinished = needs_more_work(progress)
+
         last_profile = await store.get("last_profile_at", "")
         from datetime import datetime, timezone
 
-        today = datetime.now(timezone.utc).date().isoformat()
-        if not str(last_profile).startswith(today):
-            await run_profile_async(env, fetcher)
-            await store.set("last_profile_at", datetime.now(timezone.utc).isoformat())
+        now = datetime.now(timezone.utc)
+        today = now.date().isoformat()
+        stale = not str(last_profile).startswith(today)
+
+        if unfinished or stale:
+            profile = await run_profile_async(env, fetcher)
             result["profiled"] = True
-    except Exception:
-        pass
+            result["discovery"] = profile.get("discovery", {})
+            result["discovery_line"] = describe(await load_progress(store))
+            # Only stamp the day when the pass is finished; otherwise the search
+            # is still in progress and should continue on the next tick.
+            if not needs_more_work(await load_progress(store)):
+                await store.set("last_profile_at", now.isoformat())
+        else:
+            result["discovery_line"] = describe(progress)
+    except Exception as exc:
+        result["profile_error"] = f"{type(exc).__name__}: {exc}"[:160]
 
     return result

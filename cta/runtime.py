@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from . import outputs
 from .ai import narrate_signal
 from .bot import Bot
 from .config import Config
@@ -51,6 +50,24 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
             health[name] = False
     await store.set("source_health", health)
 
+    # Record the attempt BEFORE the expensive work, and increment the cycle
+    # counter here rather than after `run_cycle`.
+    #
+    # This ordering is the whole diagnosis of the user's screenshot. The old
+    # code wrote `source_health` (three green platforms), then ran the cycle,
+    # then incremented `cycles` and wrote `last_cycle_at`. When the cycle was
+    # killed by the 50-subrequest ceiling, the counter never moved — so the
+    # dashboard showed "0 دورات" and "آخر دورة: —" next to green platforms, and
+    # `verdict()` had nothing to read. The system was working hard and reporting
+    # that it had never started.
+    #
+    # A cycle that begins is a fact worth recording even if it does not finish.
+    counters = await store.get("counters", {}) or {}
+    counters["cycles"] = int(counters.get("cycles", 0)) + 1
+    counters["attempts"] = int(counters.get("attempts", 0)) + 1
+    await store.set("counters", counters)
+    await store.set("last_attempt_at", _now().isoformat())
+
     report = await run_cycle(venues, store, cfg, now=_now())
 
     signals = report.pop("signal_objects", []) or []
@@ -66,18 +83,25 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
             if result.get("ok"):
                 delivered += 1
 
-    # Keep the positions cache fresh so /positions answers instantly.
+    # The positions cache must NOT re-poll the watchlist.
+    #
+    # This block used to call `snapshot_positions`, which runs `collect_positions`
+    # over every watched wallet — a second full sweep, immediately after `scan`
+    # had already done one. That doubled the subrequest cost of every cycle and
+    # pushed an already-over-budget invocation further over the 50 ceiling.
+    #
+    # `scan` now records what it actually measured, so the cache is derived from
+    # those observations instead of costing anything.
     try:
-        watchlist = await get_watchlist(store)
-        if watchlist:
-            positions = await outputs.snapshot_positions(venues, watchlist, cfg)
-            await store.set("positions_cache", positions)
+        await store.set("positions_cache", await _cache_from_last_scan(store))
     except Exception:
         pass
 
     await store.set("last_cycle_at", _now().isoformat())
     counters = await store.get("counters", {}) or {}
-    counters["cycles"] = int(counters.get("cycles", 0)) + 1
+    # `cycles` was already incremented when the attempt started; only the
+    # outcome counters are added here.
+    counters["completed"] = int(counters.get("completed", 0)) + 1
     counters["clusters"] = int(counters.get("clusters", 0)) + report.get("clusters", 0)
     counters["signals"] = int(counters.get("signals", 0)) + len(signals)
     await store.set("counters", counters)
@@ -93,21 +117,84 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     }
 
 
+async def _cache_from_last_scan(store) -> list[dict]:
+    """Build the `/positions` cache from the positions the scan just observed.
+
+    Reads persisted state only: no venue calls, no subrequests. If the scan has
+    not run yet the cache is empty, which is honest — there is nothing observed
+    to show.
+    """
+    observed = await store.get("last_positions", []) or []
+    out: list[dict] = []
+    for p in observed:
+        if not isinstance(p, dict):
+            continue
+        out.append(
+            {
+                "wallet": p.get("wallet"),
+                "source": p.get("source"),
+                "coin": p.get("coin"),
+                "side": p.get("side"),
+                "entry": p.get("entry"),
+                "size_usd": round(float(p.get("size_usd", 0) or 0), 2),
+                "leverage": p.get("leverage"),
+                "quality": p.get("quality"),
+                "quality_score": p.get("quality_score"),
+            }
+        )
+    return out
+
+
 async def run_profile_async(env, fetch, cfg: Optional[Config] = None) -> dict:
-    """Rebuild the watchlist from scratch (the expensive, daily job)."""
-    from .engine import profile_watchlist
+    """Advance discovery by one affordable slice.
+
+    This used to rebuild the whole watchlist in a single invocation, which
+    attempted ~901 subrequests against a 50-subrequest ceiling and died. It now
+    scores what the budget allows, persists a cursor, and resumes next run, so
+    discovery progresses across many invocations instead of failing once.
+    """
+    from .engine import profile_watchlist_resumable
 
     cfg = cfg or Config.from_env(env)
     store = store_from_env(env)
     venues = build_venues(fetch, cfg)
-    watchlist = await profile_watchlist(venues, store, cfg)
+
+    try:
+        report = await profile_watchlist_resumable(venues, store, cfg)
+    except Exception as exc:
+        # Discovery must never take the whole invocation down: the cron shares
+        # this call with the Telegram poll, so an uncaught error here is a bot
+        # that stops answering. Report the failure instead of dying.
+        report = {
+            "ok": False,
+            "scored": 0,
+            "passed": 0,
+            "total": 0,
+            "cursor": 0,
+            "complete": False,
+            "reason": f"{type(exc).__name__}: {exc}"[:160],
+            "budget": {},
+        }
+    watchlist = await get_watchlist(store)
 
     elite = sum(1 for w in watchlist if w.get("grade") == "ELITE")
+    proven = sum(1 for w in watchlist if w.get("grade") == "PROVEN")
+
     return {
-        "ok": True,
+        "ok": bool(report.get("ok")),
         "watchlist": len(watchlist),
         "elite": elite,
-        "proven": len(watchlist) - elite,
+        "proven": proven,
+        "discovery": {
+            "scored_this_run": report.get("scored", 0),
+            "passed_this_run": report.get("passed", 0),
+            "total_candidates": report.get("total", 0),
+            "cursor": report.get("cursor", 0),
+            "complete": report.get("complete", False),
+            "reason": report.get("reason", ""),
+            "failures": report.get("failures", []),
+        },
+        "budget": report.get("budget", {}),
     }
 
 

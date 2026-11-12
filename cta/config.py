@@ -76,6 +76,22 @@ class Config:
     watchlist_max: int = 150
     watchlist_min_grade: str = "PROVEN"
 
+    # ── subrequest budget (Workers free plan: 50 per invocation) ────────────
+    # Exceeding this is not a warning: the platform terminates the invocation.
+    # The original code attempted ~901 subrequests here in a single run, died,
+    # and reported the death as "0 candidates". Everything below exists to make
+    # that impossible rather than unlikely.
+    subrequest_limit: int = 50          # hard platform ceiling
+    subrequest_reserve: int = 12        # kept for Telegram + positions + health
+    discovery_fetch_retries: int = 2    # worst-case cost is retries + 1 per call
+    candidate_page_size: int = 0        # 0 = derive from the budget
+
+    # ── watchlist persistence ───────────────────────────────────────────────
+    # A resumable search scores ~10 wallets per invocation, so a pass takes
+    # hours. Without a floor the watchlist would flap to zero between passes
+    # and the radar would stop watching traders it had already approved.
+    watchlist_min_keep: int = 1
+
     # ── polling / rate limits (Hyperliquid: 1200 weight per minute per IP) ──
     hl_weight_budget_per_min: int = 900     # 25% safety margin
     hl_clearinghouse_weight: int = 2

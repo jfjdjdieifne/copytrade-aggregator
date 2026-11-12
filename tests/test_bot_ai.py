@@ -249,9 +249,25 @@ async def test_stats_judges_negative_results_honestly(bot):
     assert "سلبية" in text
 
 
-async def test_watchlist_reports_empty_state(bot):
+async def test_watchlist_distinguishes_not_started_from_still_searching(bot):
+    """An empty watchlist has two very different meanings.
+
+    Before, both said "فارغة — run curl", which told the operator nothing and
+    pointed at a CLI they cannot use from a phone. The screen that started this
+    whole investigation was "0 متداول" next to three green platforms, with no
+    way to tell whether the radar was idle or being killed mid-cycle.
+    """
     text, _ = await bot.cmd_watchlist()
-    assert "فارغة" in text
+    assert "لم يبدأ البحث" in text
+    assert "curl" not in text, "no CLI instructions: the operator is on a phone"
+
+    # With a partial pass recorded, the message must report the numbers.
+    await bot.store.set("discovery_progress", {
+        "cursor": 90, "total": 300, "scored": 90, "passed": 4, "passes": 0,
+    })
+    text, _ = await bot.cmd_watchlist()
+    assert "قيد البناء" in text
+    assert "90" in text and "300" in text
 
 
 async def test_watchlist_shows_counts(bot):

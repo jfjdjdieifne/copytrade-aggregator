@@ -28,6 +28,17 @@ class HttpError(RuntimeError):
         return self.status == 429 or 500 <= self.status < 600
 
 
+class RateLimited(RuntimeError):
+    """The venue refused us: our own budget, or the venue's.
+
+    Exists so that "we were not allowed to ask" can never be reported as "this
+    wallet has no trades". `HyperliquidVenue.fills` used to return `[]` in this
+    case, and `profile_watchlist` recorded every wallet after the 45th as "no
+    fills" — a fabricated measurement covering for a refusal. The dashboard then
+    showed "0 متداول" while all three venues were green.
+    """
+
+
 class RateLimiter:
     """Token-free sliding window over a fixed budget per minute.
 
@@ -51,6 +62,14 @@ class RateLimiter:
 
     def remaining(self) -> int:
         return max(0, self.budget - self.spent())
+
+    def refusal(self, weight: int = 1) -> str:
+        """Why `acquire(weight)` would fail, in words. Empty when it would pass."""
+        self._prune(self._clock())
+        used = sum(w for _, w in self._window)
+        if used + weight > self.budget:
+            return f"weight budget {used}/{self.budget} used, {weight} needed in this minute"
+        return ""
 
     async def acquire(self, weight: int = 1) -> bool:
         """Reserve `weight`. Returns False when the budget cannot cover it now."""
