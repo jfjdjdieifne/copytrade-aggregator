@@ -67,6 +67,20 @@ class Config:
     dydx_seed_wallets: tuple[str, ...] = ()
     gmx_seed_wallets: tuple[str, ...] = ()
 
+    # Wallets to watch before (and independently of) the leaderboard.
+    #
+    # The leaderboard is a ~39 MB file of ~47,000 wallets and cannot be parsed
+    # inside the free plan's 10 ms CPU budget. When that fetch dies, discovery
+    # has nothing to do — which is why the dashboard showed green platforms and
+    # "the search has not started" for hours. Seeds are cheap to poll (one
+    # subrequest per wallet), so a configured seed gives the radar real traders
+    # to watch from the first tick.
+    #
+    # Comma or space separated; addresses only. Empty by default: shipping a
+    # hard-coded list of popular wallets would make the bot look alive while
+    # copying strangers whose history was never scored.
+    seed_wallets: str = ""
+
     # ── discovery ───────────────────────────────────────────────────────────
     min_account_value_usd: float = 10_000.0
     min_window_volume_ratio: float = 5.0   # week volume >= 5x account value

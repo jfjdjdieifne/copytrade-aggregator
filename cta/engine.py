@@ -151,68 +151,82 @@ async def profile_watchlist_resumable(
     if not isinstance(progress, dict):
         progress = empty_progress()
 
-    # ── 1. triage the leaderboard (1 subrequest) ────────────────────────────
-    # Charge first, but never let an exhausted budget raise out of this
-    # function: the cron shares the call with the Telegram poll, so an
-    # exception here is a bot that stops answering.
+    # ── 1. assemble candidates: seeds first, leaderboard opportunistically ──
+    #
+    # The leaderboard is a ~39 MB file of ~47,000 wallets. On the Workers free
+    # plan an invocation gets 10 ms of CPU, which cannot deserialise it. The
+    # failure is silent and lands between the health write and the progress
+    # write, so the dashboard showed green platforms, climbing cycles, and a
+    # search that had never started.
+    #
+    # So the leaderboard is now *optional enrichment*. Seeds are cheap (one
+    # subrequest per wallet to poll) and give the radar real traders to watch on
+    # the first tick, whether or not the big file ever loads.
     from .budget import BudgetExhausted
+    from .seeds import merge_seeds, seeds_from_config
 
     hl = venues.get("hyperliquid")
-    rows: list = []
-    try:
-        budget.spend(1)
-    except BudgetExhausted as exc:
-        progress["last_error"] = f"budget: {exc}"[:160]
-        progress["budget"] = budget.report()
-        progress["last_run_at"] = now.isoformat()
-        await save_progress(store, progress)
-        return {
-            "ok": False,
-            "scored": 0,
-            "passed": 0,
-            "total": 0,
-            "cursor": 0,
-            "complete": False,
-            "reason": progress["last_error"],
-            "budget": budget.report(),
-            "progress": progress,
-            "watchlist_size": len(await get_watchlist(store)),
-        }
 
-    if hl is not None:
+    # (a) seeds: configured, then previously persisted, then the built-in list
+    try:
+        stored_seeds = await store.get("seed_wallets", []) or []
+    except Exception:
+        stored_seeds = []
+    seeds = merge_seeds(stored_seeds, seeds_from_config(cfg))
+    progress["seeds"] = len(seeds)
+
+    from .discovery import Candidate
+
+    candidates: list = [
+        Candidate(wallet=w, source="hyperliquid", reasons=["seed wallet"]) for w in seeds
+    ]
+
+    # (b) leaderboard: attempted only when the budget can spare it, and never
+    # fatal. A failure here is recorded and the seeds carry the cycle.
+    leaderboard_rows = 0
+    if hl is not None and budget.affordable(1):
+        budget.spend(1)
         try:
             rows = await hl.leaderboard()
+            leaderboard_rows = len(rows or [])
+            parsed = [hl.parse_leaderboard_row(r) for r in rows or []]
+            candidates += select_candidates(parsed, cfg, "hyperliquid")
+        except BudgetExhausted:
+            raise
         except Exception as exc:
+            # Includes the memory/CPU kill: the point is that it must not stop
+            # discovery from having work to do.
             progress["last_error"] = f"leaderboard: {type(exc).__name__}: {exc}"[:160]
-            rows = []
+    elif hl is not None:
+        progress["last_error"] = "leaderboard skipped: budget reserved for polling"
     else:
         progress["last_error"] = "no hyperliquid adapter"
 
-    parsed = [hl.parse_leaderboard_row(r) for r in rows] if hl is not None else []
-    candidates = select_candidates(parsed, cfg, "hyperliquid")
+    progress["leaderboard_rows"] = leaderboard_rows
+    try:
+        await store.set("seed_wallets", seeds)
+    except Exception:
+        pass
 
-    # Seeds on venues without a leaderboard contribute directly.
+    # (c) venues without a leaderboard contribute their seeds directly
     for name in ("dydx", "gmx"):
         venue = venues.get(name)
         if venue is None:
             continue
         try:
-            seeds = await venue.leaderboard()
+            venue_seeds = await venue.leaderboard()
         except Exception:
-            seeds = []
-        from .discovery import Candidate
-
-        for row in seeds:
+            venue_seeds = []
+        for row in venue_seeds:
             wallet = (row.get("wallet") or "").lower()
             if wallet:
-                candidates.append(Candidate(wallet=wallet, source=name, reasons=["seed wallet"]))
-
-    total = len(candidates)
-    progress["total"] = total
-    if rows:
-        progress["last_leaderboard_at"] = now.isoformat()
+                candidates.append(
+                    Candidate(wallet=wallet, source=name, reasons=["seed wallet"])
+                )
 
     # ── 2. decide how much of it we can afford ──────────────────────────────
+    total = len(candidates)
+    progress["total"] = total
     start = resume_index(progress, total)
     from .budget import cost_of_fetch
 
@@ -220,11 +234,10 @@ async def profile_watchlist_resumable(
     count = cfg.candidate_page_size or plan_slice(total, start, budget, per_candidate)
     count = min(count, total - start) if total else 0
 
-    # A leaderboard we could not read is not "zero candidates found": it is a
-    # failed search. Reporting ok=True here would be the same lie as the empty
-    # watchlist that started this — the distinction the operator needs is
-    # "nothing good yet" versus "we never got to look".
-    if not total and progress.get("last_error"):
+    # A leaderboard we could not read is not "zero candidates found". But with
+    # seeds present there is still work to do, so the failure is reported
+    # alongside the progress rather than replacing it.
+    if not total and progress.get("last_error") and not progress.get("seeds"):
         progress["budget"] = budget.report()
         progress["last_run_at"] = now.isoformat()
         await save_progress(store, progress)

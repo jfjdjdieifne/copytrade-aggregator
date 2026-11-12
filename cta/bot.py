@@ -273,6 +273,12 @@ class Bot:
             return await self.cmd_trace(), None
         if cmd == "details":
             return await self.cmd_details(arg), None
+        if cmd in ("add", "track", "watch"):
+            return await self.cmd_add(arg), main_keyboard()
+        if cmd in ("remove", "untrack", "unwatch"):
+            return await self.cmd_remove(arg), main_keyboard()
+        if cmd == "seeds":
+            return await self.cmd_seeds(), main_keyboard()
 
         return (
             f"أمر غير معروف: `{cmd}`\nاستخدم /help لعرض الأوامر المتاحة.",
@@ -297,6 +303,8 @@ class Bot:
             return await self.cmd_stats()
         if data == "health":
             return await self.cmd_health()
+        if data == "seeds":
+            return await self.cmd_seeds()
         return None
 
     # ── command implementations ─────────────────────────────────────────────
@@ -338,6 +346,100 @@ class Bot:
         lines.append("")
         lines.append("⚠️ المراكز بيانات عامة من المنصات، وليست توصيات.")
         return "\n".join(lines), main_keyboard()
+
+    async def cmd_add(self, raw: str) -> str:
+        """Add wallets to watch, regardless of whether discovery has run.
+
+        This exists because discovery depends on a ~39 MB leaderboard that the
+        free plan cannot always parse. Without a way to add a wallet by hand, a
+        failed leaderboard means a permanently empty radar with no remedy from
+        the chat — which is where the operator actually is.
+        """
+        from .seeds import merge_seeds, parse_addresses
+
+        found = parse_addresses(raw)
+        if not found:
+            return (
+                "⚠️ *لم أجد عنوان محفظة صالحاً*\n\n"
+                "أرسل الأمر مع العنوان، مثال:\n"
+                "`/add 0x85ecf584f25db6f146718b86d493e33c5af72052`\n\n"
+                "يمكنك لصق عدة عناوين مفصولة بمسافة أو فاصلة."
+            )
+
+        existing = await self.store.get("seed_wallets", []) or []
+        merged = merge_seeds(existing, found)
+        added = [w for w in merged if w not in set(existing)]
+        await self.store.set("seed_wallets", merged)
+
+        lines = [f"✅ *أُضيف {len(added)} متداول*" if added else "ℹ️ *موجود مسبقاً*", ""]
+        for wallet in added[:10] or found[:10]:
+            lines.append(f"• `{wallet[:8]}…{wallet[-4:]}`")
+        lines += [
+            "",
+            f"المجموع: {len(merged)} محفظة",
+            "_ستُقيَّم تلقائياً في الدورة القادمة (خلال دقيقة)._",
+            "_إن لم تجتز شروط الجودة ستُستبعد — الإضافة ليست موافقة._",
+        ]
+        return "\n".join(lines)
+
+    async def cmd_remove(self, raw: str) -> str:
+        from .seeds import normalise, parse_addresses
+
+        found = parse_addresses(raw) or ([normalise(raw)] if normalise(raw) else [])
+        if not found:
+            return "⚠️ أرسل العنوان مع الأمر: `/remove 0x...`"
+
+        existing = await self.store.get("seed_wallets", []) or []
+        keep = [w for w in existing if w not in set(found)]
+        removed = len(existing) - len(keep)
+        await self.store.set("seed_wallets", keep)
+
+        if not removed:
+            return "ℹ️ لم أجد هذا العنوان في المحافظ المبدئية."
+        return (
+            f"✅ *أُزيل {removed} محفظة*\n"
+            f"المتبقي: {len(keep)}\n\n"
+            "_إن كان المتداول مُصنَّفاً مسبقاً سيبقى في قائمة المراقبة "
+            "حتى إعادة التقييم._"
+        )
+
+    async def cmd_seeds(self) -> str:
+        """Show exactly which wallets we watch before any search has run."""
+        from .seeds import describe
+
+        seeds = await self.store.get("seed_wallets", []) or []
+        progress = await self.store.get("discovery_progress", {}) or {}
+        watchlist = await self.store.get("watchlist", []) or []
+
+        lines = [
+            "🌱 *المحافظ المبدئية*",
+            "",
+            f"• {describe(seeds)}",
+            f"• قائمة المراقبة: {len(watchlist)} متداول",
+        ]
+        if progress.get("leaderboard_rows"):
+            lines.append(f"• المتداولون من القائمة العامة: {progress['leaderboard_rows']}")
+        elif progress.get("last_error"):
+            lines.append("• القائمة العامة: تعذّرت — نعتمد على المحافظ المبدئية")
+        else:
+            lines.append("• القائمة العامة: لم تُقرأ بعد")
+
+        if seeds:
+            lines += ["", "*العناوين:*"]
+            for wallet in seeds[:15]:
+                lines.append(f"• `{wallet[:8]}…{wallet[-4:]}`")
+            if len(seeds) > 15:
+                lines.append(f"... و{len(seeds) - 15} غيرها")
+        else:
+            lines += [
+                "",
+                "لا محافظ مبدئية. أضف واحدة بـ:",
+                "`/add 0x...`",
+                "",
+                "_هذا مهم: القائمة العامة كبيرة وقد لا تُقرأ على الخطة المجانية، "
+                "فبدون محافظ مبدئية قد لا يُراقَب أحد._",
+            ]
+        return "\n".join(lines)
 
     async def cmd_watchlist(self) -> tuple[str, Optional[list]]:
         watchlist = await self.store.get(KEY_WATCHLIST, []) or []
@@ -554,6 +656,11 @@ class Bot:
         search = describe(progress)
         searching = needs_more_work(progress)
 
+        from .seeds import describe as describe_seeds
+
+        seeds = await self.store.get("seed_wallets", []) or []
+        rows = int(progress.get("leaderboard_rows", 0) or 0)
+
         lines = [
             "⚙️ *حالة النظام*",
             "",
@@ -561,6 +668,22 @@ class Bot:
             f"• إشارات مُخزّنة: {len(signals)}",
             f"• آخر دورة: {last}",
             f"• دورات مُنفَّذة: {counters.get('cycles', 0)}",
+            "",
+            "*مصدر المتداولين:*",
+            f"  {describe_seeds(seeds)}",
+        ]
+
+        # The leaderboard is a ~39 MB file that the free plan cannot always
+        # parse. Say which source actually produced the watchlist, because
+        # "0 traders" has two completely different causes.
+        if rows:
+            lines.append(f"  القائمة العامة: {rows} متداول قرئت")
+        elif progress.get("last_error") and "leaderboard" in str(progress.get("last_error", "")):
+            lines.append("  القائمة العامة: تعذّرت — نعتمد على المحافظ المبدئية")
+        elif progress.get("total"):
+            lines.append("  القائمة العامة: لم تُقرأ بعد")
+
+        lines += [
             "",
             "*البحث عن متداولين:*",
             f"  {search}",

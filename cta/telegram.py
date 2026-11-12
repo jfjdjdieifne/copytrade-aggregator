@@ -178,6 +178,7 @@ def main_keyboard() -> list[list[dict]]:
             {"text": "📉 الأداء", "callback_data": "stats"},
         ],
         [{"text": "⚙️ حالة النظام", "callback_data": "health"}],
+        [{"text": "🌱 المحافظ المبدئية", "callback_data": "seeds"}],
     ]
 
 
@@ -226,6 +227,9 @@ HELP_TEXT = """🤖 *رادار — مساعد اتفاق المتداولين*
 /why — لماذا رُفضت إشارة
 /health — حالة النظام
 /prove — أثبت أن الكشف يعمل
+/add 0x... — راقب محفظة معيّنة
+/remove 0x... — أوقف مراقبتها
+/seeds — المحافظ التي نراقبها فوراً
 /trace — آخر الأحداث
 /help — هذه القائمة
 
