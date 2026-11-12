@@ -14,7 +14,9 @@
 # and a cron trigger every minute is a single request.
 # ─────────────────────────────────────────────────────────────────────────────
 
-name = "copytrade-radar"
+# Must match the Worker name configured in the Cloudflare dashboard, otherwise
+# Workers Builds overrides it and warns that the config name is mismatched.
+name = "copytrade-aggregator"
 main = "entry.py"
 compatibility_date = "2026-09-01"
 # Required. Without it wrangler refuses to build at all:

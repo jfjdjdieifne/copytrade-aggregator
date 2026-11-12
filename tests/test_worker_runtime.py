@@ -417,3 +417,21 @@ async def test_stranger_chats_are_refused():
 
     ok = await bot.handle_update({"message": {"chat": {"id": 111}, "text": "/help"}})
     assert ok["handled"] is True
+
+
+def test_package_is_importable_from_entrypoint_directory():
+    """The one deployment invariant that broke the live build.
+
+    Cloudflare puts only the entrypoint's own directory on sys.path, and Workers
+    Builds' automatic `pip install .` also uploads a copy at build/lib/. If the
+    package ever moves back under src/ or python_modules/, the deployed Worker
+    fails at validation with [code: 10021] ModuleNotFoundError: No module named
+    'cta'. Assert the layout rather than trusting it.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    assert (root / "entry.py").is_file()
+    assert (root / "cta" / "__init__.py").is_file()
+    assert not (root / "python_modules" / "cta").exists()
+    assert not (root / "src" / "cta").exists()

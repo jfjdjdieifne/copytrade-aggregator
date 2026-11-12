@@ -47,7 +47,7 @@
 ## البنية
 
 ```
-src/cta/
+cta/            ← بجوار entry.py (شرط أساسي للنشر على Cloudflare)
 ├── config.py         إعدادات مُتحقَّقة (env أو mapping أو binding object)
 ├── models.py         Position / TraderStats / Cluster / Signal  ← الوحدة الذرية Position لا fill
 ├── classifier.py     ★ إعادة بناء منحنى رأس المال + 7 معايير → ELITE/PROVEN/WATCH/REJECT

@@ -18,12 +18,20 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 [tool.setuptools]
 py-modules = ["entry"]
 
+# `cta/` sits at the repository root, next to entry.py, because the Cloudflare
+# Workers Python runtime only puts the entrypoint's own directory on sys.path.
+# It does NOT upload a top-level `python_modules/` held there (verified with
+# `wrangler deploy --dry-run`), whereas Workers Builds' automatic `pip install .`
+# DOES upload `build/lib/cta/`, which lands off sys.path and fails validation
+# with [code: 10021] ModuleNotFoundError. Root placement satisfies both: the
+# package ships next to entry.py and `import cta` resolves on Cloudflare.
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
 include = ["cta*"]
+exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "."]
+pythonpath = ["."]
 asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
