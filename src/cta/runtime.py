@@ -167,8 +167,19 @@ async def boot_async(env, fetch) -> dict:
 
     if tg.configured:
         try:
-            webhook = await tg.set_webhook(f"{env.WORKER_URL}/telegram")
-            result["steps"].append({"webhook": webhook.get("ok", False)})
+            # The secret must be registered with Telegram *and* checked on the
+            # way in. Passing it here but not in `worker` would silently 403
+            # every update; checking it there but not passing it here would make
+            # the bot look dead. Both sides read the same env var.
+            secret = str(getattr(env, "TELEGRAM_WEBHOOK_SECRET", "") or "")
+            webhook = await tg.set_webhook(f"{env.WORKER_URL}/telegram", secret=secret)
+            result["steps"].append(
+                {"webhook": webhook.get("ok", False), "secret": bool(secret)}
+            )
+            if not webhook.get("ok"):
+                result["steps"].append(
+                    {"webhook_error": str(webhook.get("description", ""))[:150]}
+                )
         except Exception as exc:
             result["steps"].append({"webhook_error": str(exc)[:100]})
 

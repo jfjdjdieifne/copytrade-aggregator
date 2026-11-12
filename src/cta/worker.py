@@ -7,6 +7,7 @@ GET  /            short status page, safe to hit in a browser
 GET  /health      JSON health for uptime checks
 GET  /signals     last signals as JSON
 GET  /dash        full Arabic dashboard with the live state the cron built
+GET  /telegram/setup  register the Telegram webhook from a phone browser
 POST /kick        run one cycle now (owner token required)
 POST /refresh     rebuild the watchlist now (owner token required)
 POST /boot        first-run setup: webhook + watchlist (owner token required)
@@ -26,6 +27,7 @@ from .runtime import (
     track_outcomes_async,
 )
 from .dashboard import render_dashboard
+from .telegram import Telegram
 from .state import get_signals, get_watchlist, store_from_env
 
 JSON_HEADERS = {
@@ -156,6 +158,40 @@ async def handle(request, env, ctx=None, fetch=None):
             update = await _body_json(request)
             result = await handle_telegram_async(env, fetcher, update)
             return _json(result)
+
+        if path == "/telegram/setup":
+            # Deliberately a GET so it can be run from a phone's address bar:
+            # there is no easy way to send a POST from mobile Safari/Chrome, and
+            # needing one was the main reason first-run setup was painful.
+            token = str(getattr(env, "TELEGRAM_BOT_TOKEN", "") or "")
+            base = str(getattr(env, "WORKER_URL", "") or "").rstrip("/")
+            secret = str(getattr(env, "TELEGRAM_WEBHOOK_SECRET", "") or "")
+
+            if not token or not base:
+                return _json(
+                    {
+                        "ok": False,
+                        "error": "TELEGRAM_BOT_TOKEN or WORKER_URL is not set",
+                        "hint": "Add both in Settings > Variables and Secrets, then reload this page",
+                    },
+                    400,
+                )
+
+            tg = Telegram(fetcher, token)
+            hook = await tg.set_webhook(f"{base}/telegram", secret=secret)
+            info = await tg.get_webhook_info()
+            detail = info.get("result", {}) if info.get("ok") else {}
+            return _json(
+                {
+                    "ok": bool(hook.get("ok")),
+                    "registered_url": detail.get("url", ""),
+                    "expected_url": f"{base}/telegram",
+                    "secret_registered": bool(secret),
+                    "pending_updates": detail.get("pending_update_count", 0),
+                    "last_error": detail.get("last_error_message", ""),
+                    "telegram_said": hook.get("description", ""),
+                }
+            )
 
         if path in ("/", "/status", "/dash"):
             store = store_from_env(env)

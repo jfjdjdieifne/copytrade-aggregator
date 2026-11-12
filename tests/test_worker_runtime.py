@@ -319,3 +319,101 @@ async def test_entry_class_fetch_uses_self_env_when_not_passed():
     worker = entry.Default(None, env)
     body = _body(await worker.fetch(FakeRequest("https://x.dev/health")))
     assert body["ok"] is True
+
+
+# ── telegram setup (first-run from a phone) ─────────────────────────────────
+class _TGFetch:
+    """Records Telegram API calls so setup can be asserted without a network."""
+
+    def __init__(self, ok: bool = True):
+        self.ok = ok
+        self.calls: list[str] = []
+
+    async def __call__(self, url, init=None):
+        method = url.rsplit("/", 1)[-1]
+        self.calls.append(method)
+
+        class R:
+            # Telegram.call reads `resp.json()`; a fake must match that contract,
+            # not a convenient one of its own.
+            status = 200
+
+            def __init__(self, payload):
+                self._payload = payload
+
+            async def json(self):
+                return self._payload
+
+        if method == "setWebhook":
+            desc = "Webhook was set" if self.ok else "Wrong URL"
+            return R({"ok": self.ok, "result": self.ok, "description": desc})
+        if method == "getWebhookInfo":
+            return R({"ok": True, "result": {"url": "https://w.dev/telegram",
+                                             "pending_update_count": 0}})
+        return R({"ok": True, "result": {}})
+
+
+async def test_telegram_setup_registers_webhook_with_secret():
+    """Regression: the secret was checked on the way in but never registered."""
+    env = _env()
+    env.TELEGRAM_BOT_TOKEN = "123:abc"
+    env.WORKER_URL = "https://w.dev"
+    env.TELEGRAM_WEBHOOK_SECRET = "s3cret"
+    fetcher = _TGFetch()
+
+    body = _body(await handle(FakeRequest("https://w.dev/telegram/setup"), env, fetch=fetcher))
+
+    assert body["ok"] is True
+    assert "setWebhook" in fetcher.calls
+    assert body["expected_url"] == "https://w.dev/telegram"
+    assert body["secret_registered"] is True
+
+
+async def test_telegram_setup_refuses_without_token():
+    env = _env()
+    result = await handle(FakeRequest("https://w.dev/telegram/setup"), env, fetch=_TGFetch())
+    body = _body(result)
+    assert body["ok"] is False
+    assert "TELEGRAM_BOT_TOKEN" in body["error"]
+
+
+async def test_telegram_setup_reports_a_rejected_url():
+    """A wrong WORKER_URL must be visible, not silent."""
+    env = _env()
+    env.TELEGRAM_BOT_TOKEN = "123:abc"
+    env.WORKER_URL = "https://wrong.example"
+    body = _body(await handle(FakeRequest("https://w.dev/telegram/setup"), env, fetch=_TGFetch(ok=False)))
+    assert body["ok"] is False
+    assert body["last_error"] == "" or isinstance(body["last_error"], str)
+
+
+async def test_stranger_chats_are_refused():
+    """Only the owner chat may burn the shared AI allowance."""
+    from cta.bot import Bot
+    from cta.state import MemoryStore
+
+    sent: list[str] = []
+
+    class TG:
+        configured = True
+
+        async def send(self, text, chat_id=None, **_kw):
+            sent.append(text)
+            return {"ok": True}
+
+        async def typing(self, chat_id=None):
+            return None
+
+        async def answer_callback(self, *_a, **_k):
+            return None
+
+    env = _env()
+    env.TELEGRAM_CHAT_ID = "111"
+    bot = Bot(TG(), MemoryStore(), env=env)
+
+    result = await bot.handle_update({"message": {"chat": {"id": 999}, "text": "/help"}})
+    assert result["handled"] is False
+    assert "خاص" in sent[-1]
+
+    ok = await bot.handle_update({"message": {"chat": {"id": 111}, "text": "/help"}})
+    assert ok["handled"] is True
