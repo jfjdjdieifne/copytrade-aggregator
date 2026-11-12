@@ -2162,3 +2162,29 @@ async def test_prove_command_answers_in_the_chat():
 
     assert sent
     assert "الكشف يعمل" in sent[0]["text"]
+
+
+async def test_a_broken_store_does_not_silence_the_bot():
+    """Ownership is a convenience; answering is the product.
+
+    The live failure was a store error surfacing as "⚠️ خطأ غير متوقع" instead of
+    a reply. A broken backend must degrade, not muzzle the bot.
+    """
+    from cta.bot import Bot
+    from cta.state import UnavailableStore
+    from cta.telegram import Telegram
+
+    sent = []
+
+    async def sdk_fetch(resource, **options):
+        if resource.endswith("/sendMessage"):
+            sent.append(json.loads(options["body"]))
+        return _Resp({"ok": True, "result": {"message_id": 1}})
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="555")
+    bot = Bot(Telegram(sdk_fetch, "1:x", "555"), UnavailableStore("broken"), env=env)
+
+    result = await bot.handle_update(_tg_update(chat_id=555, text="/help"))
+    assert sent, "the bot must still reply when state is unreadable"
+    assert "رادار" in sent[0]["text"]
+    assert result.get("delivered") is True
