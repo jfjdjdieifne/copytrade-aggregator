@@ -57,6 +57,15 @@ class Bot:
         chat_id = parsed["chat_id"]
         text = parsed["text"]
 
+        # Anyone who finds the bot can talk to it and burn the shared Workers AI
+        # allowance (10k neurons/day on the free plan). When the owner's chat is
+        # known, everyone else gets a polite refusal instead of a conversation.
+        if not self._chat_allowed(chat_id):
+            await self.tg.send(
+                "هذا البوت خاص. غير مصرّح لهذه المحادثة.", chat_id
+            )
+            return {"handled": False, "reason": "chat not allowed", "chat_id": chat_id}
+
         if parsed["kind"] == "callback":
             await self.tg.answer_callback(parsed["callback_id"])
             reply = await self._route_callback(text, chat_id)
@@ -79,6 +88,17 @@ class Bot:
         reply = await self._converse(text, chat_id)
         await self.tg.send(reply, chat_id, keyboard=main_keyboard())
         return {"handled": True, "kind": "chat"}
+
+    def _chat_allowed(self, chat_id: str) -> bool:
+        """Only the configured owner chat may use the bot.
+
+        Empty `TELEGRAM_CHAT_ID` means "not configured yet" and is allowed, so a
+        first setup is never locked out; once it is set, it is enforced.
+        """
+        owner = str(getattr(self.env, "TELEGRAM_CHAT_ID", "") or "").strip()
+        if not owner:
+            return True
+        return str(chat_id) == owner
 
     # ── commands ────────────────────────────────────────────────────────────
     async def _route_command(self, text: str, chat_id: str) -> tuple[str, Optional[list]]:

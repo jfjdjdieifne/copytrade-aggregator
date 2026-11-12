@@ -122,6 +122,15 @@ class Telegram:
     async def delete_webhook(self) -> dict:
         return await self.call("deleteWebhook", {})
 
+    async def get_webhook_info(self) -> dict:
+        """Read back what Telegram thinks the webhook is.
+
+        Without this, a failed `setWebhook` is invisible: the bot simply goes
+        quiet and there is no way to tell a wrong URL from a wrong token from a
+        webhook that was never registered at all.
+        """
+        return await self.call("getWebhookInfo", {})
+
 
 # ── keyboards ────────────────────────────────────────────────────────────────
 def signal_keyboard(signal_id: str) -> list[list[dict]]:
