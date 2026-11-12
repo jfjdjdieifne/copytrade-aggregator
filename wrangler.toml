@@ -21,7 +21,17 @@ main = "entry.py"
 compatibility_date = "2026-09-01"
 # Required. Without it wrangler refuses to build at all:
 #   "The `python_workers` compatibility flag is required to use Python."
-compatibility_flags = ["python_workers"]
+# `disable_python_external_sdk` selects Cloudflare's BUILT-IN Python SDK.
+#
+# Without it the runtime tries to load an external `workers` package that only
+# `pywrangler` vendors into python_modules/. This project deploys with plain
+# `wrangler deploy` from Workers Builds, so nothing vendors it and validation
+# fails with:
+#   ModuleNotFoundError: No module named 'workers'
+#   You need to update to workers-py >= 1.9 or to pass disable_python_external_sdk
+# The flag is exactly what that message asks for, and we have no third-party
+# Python dependencies, so the built-in SDK is all we need.
+compatibility_flags = ["python_workers", "disable_python_external_sdk"]
 # NOTE: there is deliberately no `[python]` table. Wrangler 4.x does not know the
 # key (it warns "Unexpected fields found in top-level field: python") and the
 # scheduler is registered through `[triggers].crons` below. The old
@@ -29,7 +39,11 @@ compatibility_flags = ["python_workers"]
 
 # ── non-secret configuration ────────────────────────────────────────────────
 [vars]
-WORKER_URL = "https://copytrade-radar.<your-subdomain>.workers.dev"
+# PLACEHOLDER — replace with your real Worker URL before registering the
+# Telegram webhook, otherwise Telegram is told to post to a host that does not
+# exist and the bot looks silently dead. `/telegram/setup` prints both the
+# expected and the registered URL so a mismatch is visible rather than silent.
+WORKER_URL = "https://copytrade-aggregator.<your-subdomain>.workers.dev"
 
 # venues
 HL_BASE_URL = "https://api.hyperliquid.xyz"

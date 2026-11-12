@@ -12,6 +12,12 @@ dispatches depends on `compatibility_date`:
 
 The class methods read their bindings from `self.env`, but `cta.worker.handle`
 takes `env` explicitly, so all the routing logic stays ordinary testable Python.
+
+`RadarState` is re-exported at the bottom of this module on purpose. Cloudflare
+resolves a Durable Object's `class_name` **inside the entrypoint module**, not in
+whatever module happens to define it, so leaving it in `cta.durable_object`
+alone makes deployment fail with "no registered event handlers" / an unresolved
+class name. The import is what binds the name here.
 """
 
 from __future__ import annotations
@@ -52,6 +58,12 @@ class Default(WorkerEntrypoint):
         # env is always supplied, so the defaults below only matter in tests.
         return await scheduled(env or self.env, ctx)
 
+
+# ── Durable Object ──────────────────────────────────────────────────────────
+# `wrangler.toml` declares `class_name = "RadarState"`. Cloudflare looks that
+# name up in THIS module, so it must be bound here even though the
+# implementation lives in cta.durable_object.
+from cta.durable_object import RadarState  # noqa: E402,F401
 
 # ── legacy top-level handlers ───────────────────────────────────────────────
 # Harmless when the class-based dispatcher is in use; required if a deployment
