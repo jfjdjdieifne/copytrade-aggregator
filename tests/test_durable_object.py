@@ -14,11 +14,22 @@ from cta.durable_object import RadarState
 
 
 class FakeCursor:
-    def __init__(self, rows):
-        self._rows = rows
+    """A `SqlStorageCursor`: iterable, sync `toArray()`, not a promise.
 
-    async def toArray(self):
+    Official docs for Python show `self.sql.exec(...)` with **no await**; the
+    real cursor is synchronous. This fake previously used `async def`, which
+    hid a bug where the code awaited a non-awaitable and every DO call raised
+    TypeError -> HTTP 500 -> "Wrong response from the webhook: 500".
+    """
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def toArray(self):
         return self._rows
+
+    def __iter__(self):
+        return iter(self._rows)
 
 
 class FakeSQL:
@@ -28,7 +39,7 @@ class FakeSQL:
         self.kv: dict[str, str] = {}
         self.statements: list[str] = []
 
-    async def exec(self, statement: str, *params):
+    def exec(self, statement: str, *params):
         self.statements.append(statement.strip().split("\n")[0])
         sql = " ".join(statement.split())
         if sql.startswith("CREATE TABLE"):
@@ -112,3 +123,139 @@ async def test_radar_state_works_as_a_store():
     assert await store.get("watchlist") == [{"wallet": "0x1"}]
     await store.append("signals", {"id": "s1"}, cap=10)
     assert await store.get("signals") == [{"id": "s1"}]
+
+
+# ── the real platform contract, which our fake used to contradict ───────────
+def test_durable_object_takes_ctx_and_env():
+    """`DurableObject.__init__(self, ctx, env)` — verified against the SDK.
+
+    Calling `super().__init__(ctx)` raises
+        TypeError: DurableObject.__init__() missing 1 required positional
+        argument: 'env'
+    so the object cannot be constructed, every RPC fails, and the HTTP handler
+    returns 500. Telegram reported exactly that:
+        Wrong response from the webhook: 500 Internal Server Error
+    """
+    import inspect
+
+    from cta.durable_object import DurableObject, RadarState
+
+    base = list(inspect.signature(DurableObject.__init__).parameters)
+    assert base[:2] == ["self", "ctx"]
+    assert "env" in base
+    # and RadarState must accept both, so the runtime can pass them
+    params = list(inspect.signature(RadarState.__init__).parameters)
+    assert params[0] == "self" and params[1] == "ctx"
+    assert params[2] == "env"
+
+
+def test_radar_state_accepts_the_two_arguments_the_runtime_sends():
+    class Ctx:
+        class storage:
+            pass
+
+    inst = RadarState(Ctx(), object())
+    assert inst.ctx is not None
+    assert inst.env is not None
+
+
+async def test_sql_api_is_used_synchronously():
+    """Python's DO SQL API is synchronous — the docs show no `await`.
+
+        self.sql.exec("CREATE TABLE ...")     # not awaited
+        cursor = self.sql.exec("SELECT ...")  # returns a cursor
+        rows = cursor.toArray()               # synchronous
+
+    Awaiting either raises
+        TypeError: object SqlStorageCursor can't be used in 'await' expression
+    """
+
+    class StrictCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def toArray(self):  # sync on purpose
+            return self._rows
+
+        def __iter__(self):
+            return iter(self._rows)
+
+    class StrictSQL:
+        """Rejects being awaited: raises TypeError if the caller awaits it."""
+
+        def __init__(self):
+            self.kv = {}
+
+        def exec(self, statement, *params):
+            sql = " ".join(statement.split())
+            if sql.startswith("CREATE TABLE"):
+                return StrictCursor([])
+            if sql.startswith("SELECT"):
+                key = params[0]
+                return StrictCursor([{"v": self.kv[key]}] if key in self.kv else [])
+            if sql.startswith("INSERT"):
+                self.kv[params[0]] = params[1]
+                return StrictCursor([])
+            if sql.startswith("DELETE"):
+                self.kv.pop(params[0], None)
+                return StrictCursor([])
+            return StrictCursor([])
+
+    class Ctx:
+        def __init__(self):
+            self.storage = type("S", (), {})()
+            self.storage.sql = StrictSQL()
+
+    state = RadarState(Ctx(), None)
+    await state.storage_set("k", json.dumps({"a": 1}))
+    assert json.loads(await state.storage_get("k")) == {"a": 1}
+
+    payload = await state.storage_append("list", json.dumps({"n": 1}))
+    assert json.loads(payload) == [{"n": 1}]
+
+    await state.storage_delete("k")
+    assert await state.storage_get("k") is None
+
+
+async def test_a_store_round_trip_through_the_durable_object():
+    """The path Telegram depends on: DurableStore -> stub -> RadarState."""
+
+    class StrictCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def toArray(self):
+            return self._rows
+
+    class Sql:
+        def __init__(self):
+            self.kv = {}
+
+        def exec(self, statement, *params):
+            sql = " ".join(statement.split())
+            if sql.startswith("CREATE"):
+                return StrictCursor([])
+            if sql.startswith("SELECT"):
+                return StrictCursor([{"v": self.kv[params[0]]}] if params[0] in self.kv else [])
+            if sql.startswith("INSERT"):
+                self.kv[params[0]] = params[1]
+                return StrictCursor([])
+            if sql.startswith("DELETE"):
+                self.kv.pop(params[0], None)
+                return StrictCursor([])
+            return StrictCursor([])
+
+    class Ctx:
+        def __init__(self):
+            self.storage = type("S", (), {})()
+            self.storage.sql = Sql()
+
+    obj = RadarState(Ctx(), None)
+
+    from cta.state import DurableStore
+
+    store = DurableStore(obj)
+    await store.set("counters", {"cycles": 3})
+    assert await store.get("counters") == {"cycles": 3}
+    await store.append("signals", {"id": "x"}, cap=10)
+    assert (await store.get("signals"))[0]["id"] == "x"
