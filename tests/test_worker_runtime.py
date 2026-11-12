@@ -435,3 +435,53 @@ def test_package_is_importable_from_entrypoint_directory():
     assert (root / "cta" / "__init__.py").is_file()
     assert not (root / "python_modules" / "cta").exists()
     assert not (root / "src" / "cta").exists()
+
+
+# ── deployment invariants (learned from live Cloudflare failures) ───────────
+def test_durable_object_class_is_resolvable_from_entrypoint():
+    """Cloudflare looks up `class_name` inside the entrypoint module.
+
+    `wrangler.toml` says class_name = "RadarState". If entry.py does not bind
+    that name, deployment fails: the Worker registers no Durable Object class
+    and the STATE binding cannot be resolved. The implementation living in
+    cta.durable_object is not enough — it must be importable from entry.
+    """
+    import entry
+
+    assert hasattr(entry, "RadarState")
+    assert entry.RadarState.__name__ == "RadarState"
+
+
+def test_wrangler_declares_the_sdk_flag_and_the_do_class():
+    """The two config lines that each broke a live deploy."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    cfg = (root / "wrangler.toml").read_text(encoding="utf-8")
+
+    # Without this the runtime looks for a `workers` package that only
+    # pywrangler vendors, and validation dies with ModuleNotFoundError.
+    assert "disable_python_external_sdk" in cfg
+    assert "python_workers" in cfg
+    # Every class_name referenced must be exported by entry.py.
+    import entry
+
+    for line in cfg.splitlines():
+        if line.strip().startswith("class_name"):
+            cls = line.split("=", 1)[1].strip().strip('"')
+            assert hasattr(entry, cls), f"{cls} is declared but not exported by entry.py"
+
+
+def test_durable_object_init_matches_cloudflare_signature():
+    """The runtime passes DurableObjectState only; a required extra arg is a bug."""
+    import inspect
+
+    from cta.durable_object import RadarState
+
+    params = list(inspect.signature(RadarState.__init__).parameters)
+    assert params[0] == "self"
+    required = [
+        p for p in list(inspect.signature(RadarState.__init__).parameters.values())[2:]
+        if p.default is inspect.Parameter.empty
+    ]
+    assert required == [], "RadarState.__init__ must not require arguments beyond ctx"

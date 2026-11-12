@@ -29,9 +29,12 @@ except Exception:  # pragma: no cover - local test runs
 class RadarState(DurableObject):
     """Key/value storage with bounded append lists, on top of DO SQLite."""
 
-    def __init__(self, ctx, env=None):
+    def __init__(self, ctx):
+        # Signature must match the Cloudflare SDK exactly: the runtime calls this
+        # with the DurableObjectState only, and wraps `env` itself. The previous
+        # `(ctx, env=None)` form raised TypeError on every invocation, and its
+        # `self.env` was never read anywhere in this class.
         super().__init__(ctx)
-        self.env = env
         self._initialised = False
 
     async def _ensure_schema(self) -> None:
