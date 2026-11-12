@@ -33,6 +33,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if os.path.isdir(os.path.join(_HERE, "cta")) and _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from cta.http_bridge import crash_response, to_response  # noqa: E402
 from cta.worker import handle, scheduled  # noqa: E402
 
 try:  # Cloudflare runtime only
@@ -69,40 +70,28 @@ class Default(WorkerEntrypoint):
 
     async def fetch(self, request, env=None, ctx=None):
         # The runtime calls fetch(request); env is already on the instance.
-        # The try/except here is the last line of defence: anything that escapes
-        # becomes Cloudflare's Error 1101 — an anonymous page with no message —
-        # so a failure must be rendered as text the operator can act on.
+        #
+        # Two conversions matter here:
+        #   1. `to_response` — cta.worker returns `(body, headers)` tuples, which
+        #      the runtime cannot serve. Only a JS Response (or an RPC value)
+        #      survives the trip back; a tuple becomes Error 1101. This is the
+        #      conversion whose absence produced the blank live page.
+        #   2. the try/except — anything unexpected must be rendered as text the
+        #      operator can act on, not an anonymous "Worker threw exception".
         try:
-            return await handle(
+            payload = await handle(
                 request,
                 env if env is not None else getattr(self, "env", None),
                 ctx if ctx is not None else getattr(self, "ctx", None),
             )
+            return to_response(payload)
         except Exception as exc:
-            return _crash_page(exc)
+            return crash_response(exc)
 
     async def scheduled(self, controller=None, env=None, ctx=None):
         # Called as scheduled(controller, env, ctx); env is bound on the instance
         # already, so never trust the positional args here.
         return await scheduled(self.env, self.ctx)
-
-
-def _crash_page(exc: Exception):
-    """Explain a fatal error in one paragraph instead of a blank 1101 page."""
-    import json as _json
-    import traceback
-
-    body = _json.dumps(
-        {
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}"[:300],
-            "where": traceback.format_exc().splitlines()[-3:],
-            "hint": "افتح Workers Logs لرؤية التتبع الكامل",
-        },
-        ensure_ascii=False,
-        default=str,
-    )
-    return (body, {"status": 500, "content-type": "application/json; charset=utf-8"})
 
 
 # ── Durable Object ──────────────────────────────────────────────────────────
@@ -117,7 +106,11 @@ from cta.durable_object import RadarState  # noqa: E402,F401
 
 
 async def on_fetch(request, env, ctx=None):
-    return await handle(request, env, ctx)
+    # Same conversion as Default.fetch: a tuple is not servable.
+    try:
+        return to_response(await handle(request, env, ctx))
+    except Exception as exc:
+        return crash_response(exc)
 
 
 async def on_scheduled(env, ctx=None):

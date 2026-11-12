@@ -317,8 +317,11 @@ async def test_entry_class_fetch_uses_self_env_when_not_passed():
 
     env = _env()
     worker = entry.Default(None, env)
-    body = _body(await worker.fetch(FakeRequest("https://x.dev/health")))
-    assert body["ok"] is True
+    resp = await worker.fetch(FakeRequest("https://x.dev/health"))
+    # fetch returns a servable Response now, not the internal tuple.
+    assert resp.status == 200
+    assert "application/json" in resp.headers["content-type"]
+    assert json.loads(resp.body)["ok"] is True
 
 
 # ── telegram setup (first-run from a phone) ─────────────────────────────────
@@ -652,3 +655,171 @@ def test_store_falls_back_when_binding_is_an_opaque_object():
 
     store = store_from_env(FakeEnv(STATE=Opaque()))
     assert isinstance(store, MemoryStore)
+
+
+# ── http bridge: tuples must become servable Responses ──────────────────────
+def test_bridge_converts_the_tuple_shape_every_route_returns():
+    """cta.worker returns (body, headers). The runtime can only serve a Response.
+
+    A Python tuple is not servable: the runtime converts results with
+    python_to_rpc, which raises on tuples, and a dict of str+int is not a JS
+    Response. The platform then has nothing to send and answers Error 1101.
+    """
+    from cta.http_bridge import to_response
+
+    resp = to_response(('{"ok": true}', {"status": 200, "content-type": "application/json"}))
+    assert resp.status == 200
+    assert resp.headers["content-type"] == "application/json"
+    assert json.loads(resp.body) == {"ok": True}
+
+
+def test_bridge_keeps_the_status_the_route_chose():
+    from cta.http_bridge import to_response
+
+    assert to_response(("nope", {"status": 403})).status == 403
+    assert to_response(("boom", {"status": 500})).status == 500
+
+
+def test_bridge_accepts_status_as_a_bare_second_value():
+    from cta.http_bridge import to_response
+
+    assert to_response(("gone", 404)).status == 404
+
+
+def test_bridge_defaults_a_content_type():
+    """A Response without content-type makes browsers guess; be explicit."""
+    from cta.http_bridge import to_response
+
+    assert "text/plain" in to_response(("hi", {"status": 200})).headers["content-type"]
+
+
+def test_bridge_clamps_statuses_the_fetch_spec_rejects():
+    """Response only allows 200-599; 0 or 999 would raise on the platform."""
+    from cta.http_bridge import to_response
+
+    assert to_response(("x", {"status": 0})).status == 200
+    assert to_response(("x", {"status": 999})).status == 200
+    assert to_response(("x", {"status": "not-a-number"})).status == 200
+
+
+def test_bridge_never_raises_on_odd_bodies():
+    """The last thing between us and a blank 1101 page must not fail itself."""
+    from cta.http_bridge import to_response
+
+    assert to_response(None).status == 200
+    assert "abc" in to_response(b"abc").body
+    assert to_response({"a": 1}).body == '{"a": 1}'
+
+    class Weird:
+        def __repr__(self):
+            return "<weird>"
+
+    assert to_response(Weird()).status == 200
+
+
+def test_bridge_passes_an_already_built_response_through():
+    from cta.http_bridge import to_response
+
+    once = to_response(("hello", {"status": 200}))
+    assert to_response(once) is once
+
+
+def test_crash_response_is_json_500_not_a_blank_page():
+    from cta.http_bridge import crash_response
+
+    resp = crash_response(RuntimeError("durable object is unhappy"))
+    assert resp.status == 500
+    payload = json.loads(resp.body)
+    assert "RuntimeError" in payload["error"]
+    assert payload["ok"] is False
+
+
+async def test_every_route_return_value_is_servable():
+    """The invariant that was missing: no route may return something unservable."""
+    from cta.http_bridge import to_response
+
+    paths = ["/", "/health", "/dash", "/setup", "/setup.json", "/signals", "/nope"]
+    env = _env()
+
+    for path in paths:
+        raw = await handle(FakeRequest(f"https://w.dev{path}"), env, fetch=FakeFetch({}))
+        resp = to_response(raw)
+        assert isinstance(resp.status, int), path
+        assert 200 <= resp.status <= 599, path
+        assert resp.headers.get("content-type"), path
+        assert isinstance(resp.body, str), path
+
+
+async def test_entry_fetch_returns_a_servable_response_for_every_route():
+    """End-to-end through the entrypoint the runtime instantiates."""
+    import entry
+
+    env = _env()
+    worker = entry.Default(None, env)
+    for path in ["/", "/health", "/dash"]:
+        resp = await worker.fetch(FakeRequest(f"https://w.dev{path}"))
+        assert resp.status == 200, path
+        assert resp.body, path
+
+
+async def test_legacy_on_fetch_converts_too():
+    """on_fetch is a real dispatch path on older compatibility dates."""
+    import entry
+
+    resp = await entry.on_fetch(FakeRequest("https://w.dev/health"), _env())
+    assert resp.status == 200
+    assert json.loads(resp.body)["ok"] is True
+
+
+def test_bridge_matches_the_real_sdk_response_signature(monkeypatch):
+    """Pin the call against `workers.Response`, verified from the SDK source:
+
+        def __init__(self, body=None, status=None, status_text="", headers=None,
+                     web_socket=None)
+        # body must be str | bytes | FormData | an accepted BufferSource
+        # _to_js_headers accepts a dict
+        # the fetch spec rejects a status outside 200-599
+
+    The sandbox has no Pyodide, so no test can construct the real object; this
+    stands in for it and fails on any argument the runtime would reject.
+    """
+    import cta.http_bridge as bridge
+
+    built = []
+
+    class StrictResponse:
+        def __init__(self, body=None, status=None, status_text="", headers=None,
+                     web_socket=None):
+            if not isinstance(body, (str, bytes)) and body is not None:
+                raise TypeError(f"Unsupported type in Response: {type(body).__name__}")
+            if status is not None and not (200 <= int(status) <= 599):
+                raise ValueError(f"Invalid status {status}")
+            if headers is not None and not isinstance(headers, dict):
+                raise TypeError("Received unexpected type for headers argument")
+            self.body = body
+            self.status = status or 200
+            self.headers = dict(headers or {})
+            built.append(self)
+
+    monkeypatch.setattr(bridge, "_Response", StrictResponse)
+
+    from cta.http_bridge import crash_response, to_response
+
+    cases = [
+        ('{"ok": true}', {"status": 200, "content-type": "application/json"}),
+        ("<html></html>", {"status": 200, "content-type": "text/html; charset=utf-8"}),
+        ("denied", {"status": 403, "content-type": "text/plain"}),
+        ({"nested": {"a": 1}}, {"status": 200}),
+        (None, {"status": 200}),
+        ("x", {"status": 0}),          # must be clamped before it reaches Response
+        ("x", {"status": 999}),
+    ]
+    for body, headers in cases:
+        resp = to_response((body, headers))
+        assert isinstance(resp, StrictResponse), (body, headers)
+        assert 200 <= resp.status <= 599
+
+    crashed = crash_response(RuntimeError("boom"))
+    assert isinstance(crashed, StrictResponse)
+    assert crashed.status == 500
+    assert len(built) == len(cases) + 1
