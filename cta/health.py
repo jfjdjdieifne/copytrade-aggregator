@@ -58,6 +58,8 @@ def verdict(
     attempted = bool(health)
 
     cycles = int((counters or {}).get("cycles", 0) or 0)
+    completed = int((counters or {}).get("completed", 0) or 0)
+    attempts = int((counters or {}).get("attempts", 0) or 0)
     age_minutes = None
     if last_cycle:
         age_minutes = _age_minutes(last_cycle, now)
@@ -68,6 +70,16 @@ def verdict(
     elif not reachable:
         state = "BLIND"
         reason = "كل المنصات فشلت — النظام يعمل لكنه لا يرى أي بيانات."
+    elif attempts and not completed and age_minutes is None:
+        # Cycles are starting but none has ever finished. Before this branch,
+        # this state was reported as BLIND with the reason "no cycle yet", which
+        # was both wrong and unhelpful: the system *was* running, and dying
+        # partway. Naming it separately is what turns a mystery into a lead.
+        state = "BLIND"
+        reason = (
+            f"بدأت {attempts} دورة ولم تكتمل ولا واحدة — "
+            "النظام يعمل ثم يتوقف في منتصف الدورة. هذه مشكلة في البرنامج."
+        )
     elif age_minutes is not None and age_minutes > STALE_MINUTES:
         state = "BLIND"
         reason = f"آخر دورة ناجحة قبل {age_minutes:.0f} دقيقة — المراقبة متوقفة."
@@ -84,6 +96,8 @@ def verdict(
         "reachable": reachable,
         "attempted": attempted,
         "cycles": cycles,
+        "attempts": attempts,
+        "completed": completed,
         "age_minutes": age_minutes,
         "healthy_sources": [k for k, v in health.items() if v],
         "blind_sources": [k for k, v in health.items() if not v],
@@ -184,6 +198,63 @@ async def self_check_async(env, fetch) -> dict:
             "error": f"{type(exc).__name__}: {exc}"[:300],
             "note": "المحرّك انفجر على مدخلات معروفة النتيجة.",
         }
+
+
+async def discovery_proof_async(store) -> dict:
+    """Report the live state of the trader search, with numbers.
+
+    `/prove` used to prove only that the *detector* works on synthetic input.
+    That answered "would a signal be seen?" but not the operator's actual
+    question, which was "are you watching anyone?". Both matter, and they fail
+    independently: a working detector over an empty watchlist watches nothing.
+
+    Every field here is read from persisted state, so it describes what really
+    happened rather than what should have happened.
+    """
+    from .discovery_resume import describe, load_progress, needs_more_work
+
+    try:
+        progress = await load_progress(store)
+    except Exception as exc:
+        return {
+            "available": False,
+            "reason": f"{type(exc).__name__}: {exc}"[:160],
+            "note": "تعذّرت قراءة حالة البحث.",
+        }
+
+    watchlist = []
+    try:
+        watchlist = await store.get("watchlist", []) or []
+    except Exception:
+        watchlist = []
+
+    total = int(progress.get("total", 0) or 0)
+    cursor = int(progress.get("cursor", 0) or 0)
+    return {
+        "available": True,
+        "line": describe(progress),
+        "watching": len(watchlist),
+        "candidates": total,
+        "cursor": cursor,
+        "scored": int(progress.get("scored", 0) or 0),
+        "passed": int(progress.get("passed", 0) or 0),
+        "passes": int(progress.get("passes", 0) or 0),
+        "searching": needs_more_work(progress),
+        "last_run_at": progress.get("last_run_at", ""),
+        "last_error": progress.get("last_error", ""),
+        "verdict": _discovery_verdict(progress, len(watchlist)),
+    }
+
+
+def _discovery_verdict(progress: dict, watching: int) -> str:
+    """One honest sentence about whether the radar is actually watching."""
+    if watching > 0:
+        return f"يراقب {watching} متداولاً"
+    if not progress.get("total"):
+        return "لم يبدأ البحث بعد"
+    if progress.get("last_error") and not progress.get("scored"):
+        return f"البحث متعثّر: {str(progress['last_error'])[:80]}"
+    return f"يبحث الآن — فُحص {progress.get('scored', 0)} محفظة"
 
 
 def _signal_summary(signal) -> dict:

@@ -342,9 +342,25 @@ class Bot:
     async def cmd_watchlist(self) -> tuple[str, Optional[list]]:
         watchlist = await self.store.get(KEY_WATCHLIST, []) or []
         if not watchlist:
+            from .discovery_resume import describe, load_progress
+
+            progress = await load_progress(self.store)
+            search = describe(progress)
+            if progress.get("total"):
+                # The search is running: say so, with numbers. "Empty" and
+                # "still looking" are different states and the operator needs
+                # to tell them apart from a phone.
+                return (
+                    "👥 *قائمة المراقبة قيد البناء*\n"
+                    f"{search}\n\n"
+                    "كل دقيقة تُفحص دفعة جديدة تلقائياً.\n"
+                    "استخدم /health لمتابعة التقدّم.",
+                    main_keyboard(),
+                )
             return (
-                "👥 قائمة المراقبة فارغة.\n"
-                "شغّل دورة التقييم: `curl -X POST <worker>/refresh`",
+                "👥 *لم يبدأ البحث بعد*\n"
+                "ستبدأ أول دفعة تلقائياً خلال دقيقة.\n"
+                "تحقّق من /health — سترى عدد المحافظ المفحوصة.",
                 main_keyboard(),
             )
 
@@ -357,8 +373,13 @@ class Bot:
             "",
         ]
         for w in watchlist[:12]:
+            # A bare address prefix is unreadable: every Hyperliquid wallet starts
+            # 0x00 or 0x1f, so twelve rows all looked like `0x00000000`. Show the
+            # head *and* tail, which is how traders actually recognise a wallet.
+            wallet = str(w.get("wallet", ""))
+            short = f"{wallet[:6]}…{wallet[-4:]}" if len(wallet) > 12 else wallet
             lines.append(
-                f"• `{str(w.get('wallet', ''))[:10]}` · {w.get('grade')} {w.get('score', 0)}/100 · "
+                f"• `{short}` · {w.get('grade')} {w.get('score', 0)}/100 · "
                 f"{w.get('n_trades', 0)} صفقة · PF {w.get('profit_factor', 0)}"
             )
         if len(watchlist) > 12:
@@ -464,6 +485,26 @@ class Bot:
         ]
         if sample.get("entry"):
             lines.append(f"• دخول {sample.get('entry')} · وقف {sample.get('stop')} · هدف {sample.get('target')}")
+
+        # Two independent questions, and they fail independently: "would a
+        # signal be seen?" and "is anyone actually being watched?". A working
+        # detector over an empty watchlist watches nobody, which is exactly the
+        # state the operator was in when they asked.
+        from .health import discovery_proof_async
+
+        discovery = await discovery_proof_async(self.store)
+        lines += ["", "*هل نراقب أحداً فعلاً؟*"]
+        if discovery.get("available"):
+            lines.append(f"• {discovery.get('verdict')}")
+            if discovery.get("candidates"):
+                lines.append(f"• {discovery.get('line')}")
+            if discovery.get("watching"):
+                lines.append("• الدورة القادمة ستفحص مراكز هؤلاء المتداولين")
+            else:
+                lines.append("• لا متداولين بعد — البحث يعمل لكنه لم يُكمل دفعة")
+        else:
+            lines.append(f"• تعذّرت القراءة: {discovery.get('reason', '')}")
+
         lines += [
             "",
             "_أي سكوت بعد اليوم يعني سوقاً هادئاً، لا نظاماً معطّلاً._",
@@ -507,6 +548,12 @@ class Bot:
         last = await self.store.get("last_cycle_at", "—")
         health = await self.store.get("source_health", {}) or {}
 
+        from .discovery_resume import describe, load_progress, needs_more_work
+
+        progress = await load_progress(self.store)
+        search = describe(progress)
+        searching = needs_more_work(progress)
+
         lines = [
             "⚙️ *حالة النظام*",
             "",
@@ -515,10 +562,34 @@ class Bot:
             f"• آخر دورة: {last}",
             f"• دورات مُنفَّذة: {counters.get('cycles', 0)}",
             "",
-            "*المنصات:*",
+            "*البحث عن متداولين:*",
+            f"  {search}",
         ]
+        if searching:
+            lines.append("  ⏳ البحث جارٍ — يتقدّم خطوة كل دقيقة")
+        elif progress.get("passes"):
+            lines.append("  ✅ اكتملت دورة بحث كاملة")
+        else:
+            lines.append("  ⚠️ لم يكتمل بحث بعد")
+
+        rotation = await self.store.get("scan_rotation", {}) or {}
+        if rotation.get("watching"):
+            lines.append("")
+            lines.append("*دورة الفحص:*")
+            lines.append(f"  يفحص {rotation.get('polled')} من {rotation.get('watching')} كل دقيقة")
+            lines.append(f"  كل متداول يُفحص مرة كل {rotation.get('minutes_per_sweep', 1)} دقيقة")
+
+        lines.append("")
+        lines.append("*المنصات:*")
         for name, ok in (health or {}).items():
             lines.append(f"  {name}: {'🟢 متصل' if ok else '🔴 لا يستجيب'}")
+
+        # A green platform with an empty watchlist is the exact screen that made
+        # the operator think the system was idle when it was actually being
+        # killed mid-cycle. Say which one it is.
+        if health and not watchlist:
+            lines.append("")
+            lines.append("⚠️ المنصات متصلة لكن القائمة فارغة — البحث لم يُكمل بعد")
 
         budget = self.budget
         lines.append("")

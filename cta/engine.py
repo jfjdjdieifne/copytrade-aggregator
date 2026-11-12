@@ -22,7 +22,7 @@ from .convergence import detect_convergence
 from .discovery import build_watchlist, select_candidates
 from .models import Cluster, Position, Signal, TraderStats
 from .plan import build_plan
-from .state import KEY_PROFILES, KEY_WATCHLIST, Store
+from .state import KEY_PROFILES, KEY_WATCHLIST, Store, get_watchlist
 
 UTC = timezone.utc
 
@@ -106,6 +106,207 @@ async def profile_watchlist(
     return watchlist
 
 
+async def profile_watchlist_resumable(
+    venues: dict,
+    store: Store,
+    cfg: Optional[Config] = None,
+    budget=None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Score as many leaderboard candidates as this invocation can afford.
+
+    Why this exists
+    ---------------
+    ``profile_watchlist`` scored up to 300 candidates in one invocation. Each
+    fill call costs up to 3 subrequests (2 retries), so the worst case was 901
+    against the free plan's 50-subrequest ceiling. The platform terminated the
+    invocation and ``except Exception: continue`` reported the termination as
+    "no candidates" — three green platforms next to "0 متداول".
+
+    This version never attempts more than the budget allows, persists a cursor,
+    and resumes next invocation. Discovery becomes a patient multi-run search
+    instead of a doomed all-at-once one.
+
+    Returns a report describing the pass, never a bare list: the caller needs to
+    distinguish "nothing good found yet" from "we are still looking".
+    """
+    from .budget import SubrequestBudget
+    from .discovery_resume import (
+        empty_progress,
+        load_progress,
+        merge_watchlist,
+        plan_slice,
+        resume_index,
+        save_progress,
+        score_slice,
+        needs_more_work,
+    )
+    from .state import KEY_PROFILES
+
+    cfg = cfg or Config()
+    now = now or datetime.now(UTC)
+    budget = budget or SubrequestBudget(cfg.subrequest_limit, cfg.subrequest_reserve)
+
+    progress = await load_progress(store)
+    if not isinstance(progress, dict):
+        progress = empty_progress()
+
+    # ── 1. triage the leaderboard (1 subrequest) ────────────────────────────
+    # Charge first, but never let an exhausted budget raise out of this
+    # function: the cron shares the call with the Telegram poll, so an
+    # exception here is a bot that stops answering.
+    from .budget import BudgetExhausted
+
+    hl = venues.get("hyperliquid")
+    rows: list = []
+    try:
+        budget.spend(1)
+    except BudgetExhausted as exc:
+        progress["last_error"] = f"budget: {exc}"[:160]
+        progress["budget"] = budget.report()
+        progress["last_run_at"] = now.isoformat()
+        await save_progress(store, progress)
+        return {
+            "ok": False,
+            "scored": 0,
+            "passed": 0,
+            "total": 0,
+            "cursor": 0,
+            "complete": False,
+            "reason": progress["last_error"],
+            "budget": budget.report(),
+            "progress": progress,
+            "watchlist_size": len(await get_watchlist(store)),
+        }
+
+    if hl is not None:
+        try:
+            rows = await hl.leaderboard()
+        except Exception as exc:
+            progress["last_error"] = f"leaderboard: {type(exc).__name__}: {exc}"[:160]
+            rows = []
+    else:
+        progress["last_error"] = "no hyperliquid adapter"
+
+    parsed = [hl.parse_leaderboard_row(r) for r in rows] if hl is not None else []
+    candidates = select_candidates(parsed, cfg, "hyperliquid")
+
+    # Seeds on venues without a leaderboard contribute directly.
+    for name in ("dydx", "gmx"):
+        venue = venues.get(name)
+        if venue is None:
+            continue
+        try:
+            seeds = await venue.leaderboard()
+        except Exception:
+            seeds = []
+        from .discovery import Candidate
+
+        for row in seeds:
+            wallet = (row.get("wallet") or "").lower()
+            if wallet:
+                candidates.append(Candidate(wallet=wallet, source=name, reasons=["seed wallet"]))
+
+    total = len(candidates)
+    progress["total"] = total
+    if rows:
+        progress["last_leaderboard_at"] = now.isoformat()
+
+    # ── 2. decide how much of it we can afford ──────────────────────────────
+    start = resume_index(progress, total)
+    from .budget import cost_of_fetch
+
+    per_candidate = cost_of_fetch(cfg.discovery_fetch_retries)
+    count = cfg.candidate_page_size or plan_slice(total, start, budget, per_candidate)
+    count = min(count, total - start) if total else 0
+
+    # A leaderboard we could not read is not "zero candidates found": it is a
+    # failed search. Reporting ok=True here would be the same lie as the empty
+    # watchlist that started this — the distinction the operator needs is
+    # "nothing good yet" versus "we never got to look".
+    if not total and progress.get("last_error"):
+        progress["budget"] = budget.report()
+        progress["last_run_at"] = now.isoformat()
+        await save_progress(store, progress)
+        return {
+            "ok": False,
+            "scored": 0,
+            "passed": 0,
+            "total": 0,
+            "cursor": start,
+            "complete": False,
+            "reason": progress["last_error"],
+            "budget": budget.report(),
+            "progress": progress,
+            "watchlist_size": len(await get_watchlist(store)),
+        }
+
+    if total and count <= 0:
+        # Budget was consumed before discovery could start. Record it; do not
+        # pretend the search ran.
+        progress["last_error"] = "budget exhausted before discovery could start"
+        progress["budget"] = budget.report()
+        progress["last_run_at"] = now.isoformat()
+        await save_progress(store, progress)
+        return {
+            "ok": False,
+            "scored": 0,
+            "passed": 0,
+            "total": total,
+            "cursor": start,
+            "complete": False,
+            "reason": progress["last_error"],
+            "budget": budget.report(),
+            "progress": progress,
+            "watchlist_size": len(await get_watchlist(store)),
+        }
+
+    # ── 3. score the affordable slice ──────────────────────────────────────
+    stats, done, failures = await score_slice(candidates, start, count, venues, cfg, budget)
+    progress["cursor"] = start + done
+    progress["scored"] = int(progress.get("scored", 0) or 0) + len(stats)
+
+    if progress["cursor"] >= total and total:
+        progress["passes"] = int(progress.get("passes", 0) or 0) + 1
+        progress["cursor"] = 0          # a completed pass restarts on fresh data
+    progress["skipped"] = max(0, count - done)
+
+    # ── 4. merge into the persistent watchlist ─────────────────────────────
+    existing = await store.get(KEY_WATCHLIST, []) or []
+    merged = merge_watchlist(existing, stats, cfg)
+    await store.set(KEY_WATCHLIST, merged)
+
+    passed = len([s for s in stats if getattr(s, "grade", "REJECT") in ("ELITE", "PROVEN")])
+    progress["passed"] = int(progress.get("passed", 0) or 0) + passed
+
+    # Also accumulate the full scored set so /stats can show the funnel.
+    all_scored = await store.get(KEY_PROFILES, []) or []
+    known = {str(p.get("wallet")) for p in all_scored if isinstance(p, dict)}
+    for s in stats:
+        if s.wallet not in known:
+            all_scored.append(_stats_to_dict(s))
+    await store.set(KEY_PROFILES, all_scored[:400])
+
+    progress["budget"] = budget.report()
+    progress["last_run_at"] = now.isoformat()
+    if failures:
+        progress["last_error"] = failures[0].get("why", "")[:160]
+    await save_progress(store, progress)
+
+    return {
+        "ok": True,
+        "scored": len(stats),
+        "passed": passed,
+        "total": total,
+        "cursor": progress["cursor"],
+        "complete": not needs_more_work(progress),
+        "watchlist_size": len(merged),
+        "failures": failures[:5],
+        "budget": budget.report(),
+        "progress": progress,
+    }
+
+
 def _stats_to_dict(s: TraderStats) -> dict:
     return {
         "wallet": s.wallet,
@@ -155,6 +356,16 @@ async def collect_positions(
             positions.append(p)
 
     return merge_members(dedupe_positions(positions))
+
+
+def cost_of_position(cfg: Config) -> int:
+    """Worst-case subrequests for one wallet's positions call.
+
+    `clearinghouseState` is normally a single subrequest, but `http_json`
+    retries, and a rotating sweep must assume the expensive case or it will
+    overshoot the ceiling exactly when the venue is flaky.
+    """
+    return 1 + max(0, int(getattr(cfg, "discovery_fetch_retries", 2)))
 
 
 def build_signal(
@@ -232,7 +443,53 @@ async def scan(
     if not watchlist:
         return [], []
 
-    positions = await collect_positions(venues, watchlist, cfg)
+    # ── rotate the sweep so every watched wallet gets polled ────────────────
+    # `collect_positions` costs one subrequest per wallet, and an invocation may
+    # only make 50. With 150 watched wallets the old code died at wallet 50 on
+    # every single tick: the last hundred traders were never polled at all. The
+    # radar looked busy and watched two thirds of nobody.
+    #
+    # Now each tick polls a rotating window sized to the budget, and persists
+    # where it stopped. Every trader is covered every ceil(n/window) minutes.
+    from .budget import SubrequestBudget
+
+    sweep = SubrequestBudget(cfg.subrequest_limit, cfg.subrequest_reserve)
+    window = max(1, min(len(watchlist), sweep.ceiling // cost_of_position(cfg)))
+    offset = int(await store.get("scan_cursor", 0) or 0) % max(1, len(watchlist))
+    rotated = list(watchlist[offset:]) + list(watchlist[:offset])
+    batch = rotated[:window]
+    await store.set("scan_cursor", (offset + len(batch)) % max(1, len(watchlist)))
+    await store.set(
+        "scan_rotation",
+        {
+            "offset": offset,
+            "polled": len(batch),
+            "watching": len(watchlist),
+            "minutes_per_sweep": (len(watchlist) + window - 1) // window,
+        },
+    )
+
+    positions = await collect_positions(venues, batch, cfg, limit=window)
+
+    # Record what was actually observed, so `/positions` costs nothing later.
+    # Writing the snapshot here rather than re-polling keeps one sweep per tick.
+    try:
+        await store.set("last_positions", [
+            {
+                "wallet": p.wallet,
+                "source": p.source,
+                "coin": p.coin,
+                "side": p.side,
+                "entry": p.entry,
+                "size_usd": round(p.size_usd, 2),
+                "leverage": p.leverage,
+                "quality": p.quality,
+                "quality_score": p.quality_score,
+            }
+            for p in positions[:400]
+        ])
+    except Exception:
+        pass
 
     if prices is None:
         prices = {}
