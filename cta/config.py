@@ -135,6 +135,13 @@ class Config:
     ai_daily_neuron_soft_cap: int = 8_000   # leave headroom under 10k free
     ai_timeout_ms: int = 25_000
 
+    # ── paper account (the $100 test the operator asked for) ────────────────
+    # Every signal is taken automatically on a fixed account so the strategy is
+    # measured rather than remembered. Risk is a percentage of the *current*
+    # balance, so results compound honestly instead of assuming a constant stake.
+    paper_start_balance: float = 100.0
+    paper_risk_pct: float = 2.0
+
     # ── ops ─────────────────────────────────────────────────────────────────
     state_actor_name: str = "radar-state"
     dry_run: bool = False
