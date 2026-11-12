@@ -1,0 +1,4 @@
+# copytrade-aggregator — تبعيات التشغيل
+# جميع النتائج افتراضية (HYPOTHETICAL_) ولا تشكل نصيحة استثمارية.
+
+aiohttp>=3.8.0
