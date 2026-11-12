@@ -255,6 +255,8 @@ class Bot:
             return await self.cmd_why(arg)
         if cmd == "health":
             return await self.cmd_health(), None
+        if cmd in ("prove", "verify"):
+            return await self.cmd_prove(), None
         if cmd == "trace":
             return await self.cmd_trace(), None
         if cmd == "details":
@@ -419,6 +421,42 @@ class Bot:
         lines.append("")
         lines.append("هذا مهم: النظام يصمت لأسباب، لا لأنه معطّل.")
         return "\n".join(lines), main_keyboard()
+
+    async def cmd_prove(self) -> str:
+        """Prove the detector works, on demand, in the chat.
+
+        Waiting days to discover the radar is blind is the worst trade in this
+        system. This runs a synthetic convergence through the real engine and
+        reports what it produced.
+        """
+        from .health import self_check_async
+
+        report = await self_check_async(self.env, None)
+        if not report.get("ok"):
+            detail = report.get("error") or report.get("note", "")
+            return (
+                "⚠️ *الكشف لا يعمل*\n\n"
+                f"`{_escape(str(detail))[:300]}`\n\n"
+                "هذا خلل في البرنامج، وليس سوقاً هادئاً. أرسل /trace أيضاً."
+            )
+
+        sample = report.get("sample") or {}
+        lines = [
+            "✅ *الكشف يعمل*",
+            "",
+            "مرّرت متداولَين اصطناعيين عبر المحرّك الحقيقي، فأنتج:",
+            "",
+            f"• {sample.get('coin')} — {sample.get('side')}",
+            f"• الدرجة: {sample.get('score')}/100 ({sample.get('level')})",
+            f"• من {sample.get('n_independent')} متداول مستقل",
+        ]
+        if sample.get("entry"):
+            lines.append(f"• دخول {sample.get('entry')} · وقف {sample.get('stop')} · هدف {sample.get('target')}")
+        lines += [
+            "",
+            "_أي سكوت بعد اليوم يعني سوقاً هادئاً، لا نظاماً معطّلاً._",
+        ]
+        return "\n".join(lines)
 
     async def cmd_trace(self) -> str:
         """Show the last few things that happened, from inside the chat.

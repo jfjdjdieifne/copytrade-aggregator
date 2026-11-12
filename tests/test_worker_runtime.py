@@ -254,7 +254,11 @@ async def test_dash_route_renders_live_dashboard():
          "n_trades": 300, "profit_factor": 2.4, "max_drawdown": 0.08},
     ])
     await env.STATE.set("source_health", {"hyperliquid": True})
-    await env.STATE.set("last_cycle_at", "2026-11-12T10:00:00+00:00")
+    await env.STATE.set("counters", {"cycles": 5})
+    # A fresh stamp: a stale one is correctly reported as BLIND, so this test
+    # would otherwise be asserting the wrong thing.
+    from datetime import datetime, timezone
+    await env.STATE.set("last_cycle_at", datetime.now(timezone.utc).isoformat())
 
     body, headers = await handle(FakeRequest("https://x.dev/dash"), env, fetch=FakeFetch({}))
 
@@ -262,8 +266,9 @@ async def test_dash_route_renders_live_dashboard():
     assert 'dir="rtl"' in body
     assert "0xabc" in body
     assert "2026-11-12" in body
-    # A reachable venue must flip the banner to live, not demo.
-    assert "بيانات حيّة" in body
+    # A reachable venue with a fresh cycle must show the watching banner.
+    assert "نراقب فعلاً" in body
+    assert "لا يرى المنصات" not in body
 
 
 async def test_dash_before_first_cycle_says_nothing_happened():
@@ -1815,3 +1820,345 @@ async def test_trace_command_reports_recorded_events():
     assert sent
     assert "آخر الأحداث" in sent[0]["text"]
     assert "update" in sent[0]["text"] or "reply" in sent[0]["text"]
+
+
+# ── polling instead of a webhook ────────────────────────────────────────────
+class _PollTG:
+    """getUpdates endpoint: hands out queued updates, then nothing."""
+
+    def __init__(self, updates=None, webhook=""):
+        self.pending = list(updates or [])
+        self.webhook = webhook
+        self.offset_seen = []
+        self.deleted = False
+        self.sent = []
+
+    async def __call__(self, url, init=None, **kw):
+        method = url.rsplit("/", 1)[-1]
+        body = {}
+        if isinstance(init, dict) and init.get("body"):
+            body = json.loads(init["body"])
+
+        class R:
+            status = 200
+
+            def __init__(self, payload):
+                self._p = payload
+
+            async def json(self):
+                return self._p
+
+            async def text(self):
+                return json.dumps(self._p)
+
+        if method == "getUpdates":
+            self.offset_seen.append(body.get("offset"))
+            batch = [u for u in self.pending if u["update_id"] >= (body.get("offset") or 0)]
+            return R({"ok": True, "result": batch})
+        if method == "getWebhookInfo":
+            return R({"ok": True, "result": {"url": self.webhook,
+                                             "pending_update_count": len(self.pending)}})
+        if method == "deleteWebhook":
+            self.deleted = True
+            self.webhook = ""
+            return R({"ok": True, "result": True})
+        if method == "sendMessage":
+            self.sent.append(body)
+            return R({"ok": True, "result": {"message_id": len(self.sent)}})
+        return R({"ok": True, "result": True})
+
+
+async def test_polling_delivers_messages_without_any_webhook():
+    """The webhook's failure mode was silence; polling has no such failure.
+
+    Nothing has to reach the Worker, so a broken response cannot break the
+    channel. If the Worker is up, the bot answers.
+    """
+    from cta.poller import poll_updates_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    tg = _PollTG([_tg_update(chat_id=555, text="/help")])
+
+    report = await poll_updates_async(env, tg)
+
+    assert report["ok"] is True
+    assert report["taken"] == 1
+    assert report["replied"] == 1
+    assert tg.sent, "the reply must actually be sent"
+
+
+async def test_polling_removes_a_webhook_once_because_they_conflict():
+    """Telegram refuses getUpdates while a webhook is registered."""
+    from cta.poller import poll_updates_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    tg = _PollTG([], webhook="https://w.dev/telegram")
+
+    report = await poll_updates_async(env, tg)
+    assert tg.deleted is True
+    assert report.get("webhook_removed") == "https://w.dev/telegram"
+
+
+async def test_the_offset_advances_so_messages_are_not_answered_twice():
+    from cta.poller import poll_updates_async
+    from cta.state import KEY_TG_OFFSET, store_from_env
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    tg = _PollTG([_tg_update(chat_id=555, text="/help")])
+
+    await poll_updates_async(env, tg)
+    offset = await store_from_env(env).get(KEY_TG_OFFSET)
+    assert offset == 2  # update_id 1 -> next request starts at 2
+
+    # Second poll asks from the new offset and finds nothing to re-answer.
+    await poll_updates_async(env, tg)
+    assert tg.offset_seen[-1] == 2
+
+
+async def test_one_bad_message_does_not_block_the_queue():
+    """A message that cannot be handled must not stall everything behind it."""
+    from cta.poller import poll_updates_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    broken = {"update_id": 1}  # no message key -> handled:false, but not fatal
+    good = _tg_update(chat_id=555, text="/help")
+    good["update_id"] = 2
+
+    tg = _PollTG([broken, good])
+    report = await poll_updates_async(env, tg)
+    assert report["taken"] == 2
+    assert tg.sent, "the good message must still be answered"
+
+
+async def test_polling_never_raises_when_telegram_is_unreachable():
+    from cta.poller import poll_updates_async
+
+    async def dead(url, init=None, **kw):
+        raise ConnectionError("no route to host")
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    report = await poll_updates_async(env, dead)
+    assert report["ok"] is False
+    assert "no route" in report["error"]
+
+
+async def test_cron_polls_telegram_before_doing_the_cycle():
+    """Ordering: replies must not wait behind slow venue calls."""
+    import cta.worker as W
+    from cta.state import MemoryStore
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    env.STATE = MemoryStore()
+    order = []
+
+    async def fake_poll(*_a, **_k):
+        order.append("poll")
+        return {"ok": True}
+
+    async def fake_cycle(*_a, **_k):
+        order.append("cycle")
+        return {}
+
+    original_poll = W.poll_updates_async
+    W.poll_updates_async = fake_poll
+    try:
+        import cta.runtime as R
+        original_cycle = R.run_cycle_async
+        R.run_cycle_async = fake_cycle
+        try:
+            await W.scheduled(env, fetch=_PollTG())
+        finally:
+            R.run_cycle_async = original_cycle
+    finally:
+        W.poll_updates_async = original_poll
+
+    assert order and order[0] == "poll"
+
+
+# ── the detector must be provable, not assumed ──────────────────────────────
+async def test_self_check_produces_a_signal_from_synthetic_traders():
+    """If this fails, silence is ambiguous — and ambiguity is the real bug.
+
+    Waiting days to learn the detector is broken costs the most and teaches the
+    least. This runs the real engine on a known-good input and asserts it fires.
+    """
+    from cta.health import self_check_async
+
+    env = _env(
+        MIN_INDEPENDENT_TRADERS="2", MIN_ELITE_OR_PROVEN="2",
+        MIN_SIGNAL_SCORE="65", CONVERGENCE_WINDOW_MIN="90",
+        WATCHLIST_MIN_GRADE="PROVEN", ENTRY_TOLERANCE_BPS="50",
+        MAX_SLIPPAGE_BPS="50", MAX_MEDIAN_LEVERAGE="10",
+        DISCOVERY_MAX_CANDIDATES="300", WATCHLIST_MAX="150", DRY_RUN="true",
+    )
+    report = await self_check_async(env, None)
+
+    assert report["ok"] is True, report.get("error") or report.get("note")
+    assert report["signals"] >= 1
+    sample = report["sample"]
+    assert sample["coin"] and sample["side"]
+    assert sample["score"] >= 65
+    assert sample["n_independent"] >= 2
+
+
+def test_two_traders_can_clear_the_threshold():
+    """The arithmetic must permit the configuration to succeed.
+
+    Consensus was `(n-1)*12`, so the minimum viable cluster of 2 could reach at
+    most 72 points — and realistically 61-64, under the 65 bar. The radar could
+    watch perfect convergence forever and never emit. That is a threshold that
+    can never be met, disguised as a quiet market.
+    """
+    from datetime import datetime, timezone
+
+    from cta.confidence import score_cluster
+    from cta.config import Config
+    from cta.models import Cluster, Position
+
+    class Env:
+        MIN_INDEPENDENT_TRADERS = "2"
+        MIN_ELITE_OR_PROVEN = "2"
+        MIN_SIGNAL_SCORE = "65"
+        ENTRY_TOLERANCE_BPS = "50"
+        CONVERGENCE_WINDOW_MIN = "90"
+
+    cfg = Config.from_env(Env())
+    now = datetime.now(timezone.utc)
+
+    def member(wallet, q):
+        return Position(wallet=wallet, source="hyperliquid", coin="BTC",
+                        signed_size=2.0, entry=65000.0, size_usd=130000.0,
+                        leverage=3.0, opened_at=now, quality="ELITE",
+                        quality_score=q)
+
+    perfect_pair = Cluster(
+        coin="BTC", side="LONG",
+        members=[member("a", 95), member("b", 92)],
+        entry_center=65000.0, spread_bps=5.0, time_span_min=3.0,
+        sources=["hyperliquid"],
+    )
+    assert score_cluster(perfect_pair, cfg).total >= 65
+
+    trio = Cluster(
+        coin="BTC", side="LONG",
+        members=[member("a", 95), member("b", 92), member("c", 88)],
+        entry_center=65000.0, spread_bps=5.0, time_span_min=3.0,
+        sources=["hyperliquid"],
+    )
+    assert score_cluster(trio, cfg).total > score_cluster(perfect_pair, cfg).total
+
+
+def test_a_mediocre_pair_is_still_rejected():
+    """The bar must still mean something — widening it must not make it free."""
+    from datetime import datetime, timezone
+
+    from cta.confidence import score_cluster
+    from cta.config import Config
+    from cta.models import Cluster, Position
+
+    class Env:
+        MIN_INDEPENDENT_TRADERS = "2"
+        MIN_ELITE_OR_PROVEN = "2"
+        MIN_SIGNAL_SCORE = "65"
+        ENTRY_TOLERANCE_BPS = "50"
+        CONVERGENCE_WINDOW_MIN = "90"
+
+    cfg = Config.from_env(Env())
+    now = datetime.now(timezone.utc)
+
+    def member(wallet, q):
+        return Position(wallet=wallet, source="hyperliquid", coin="BTC",
+                        signed_size=2.0, entry=65000.0, size_usd=130000.0,
+                        leverage=3.0, opened_at=now, quality="PROVEN",
+                        quality_score=q)
+
+    mediocre = Cluster(
+        coin="BTC", side="LONG",
+        members=[member("a", 62), member("b", 58)],
+        entry_center=65000.0, spread_bps=30.0, time_span_min=40.0,
+        sources=["hyperliquid"],
+    )
+    assert score_cluster(mediocre, cfg).total < 65
+
+
+async def test_prove_route_renders_the_evidence():
+    from cta.worker import handle
+
+    env = _env(
+        MIN_INDEPENDENT_TRADERS="2", MIN_ELITE_OR_PROVEN="2",
+        MIN_SIGNAL_SCORE="65", CONVERGENCE_WINDOW_MIN="90",
+        WATCHLIST_MIN_GRADE="PROVEN", ENTRY_TOLERANCE_BPS="50",
+        MAX_SLIPPAGE_BPS="50", MAX_MEDIAN_LEVERAGE="10",
+        DISCOVERY_MAX_CANDIDATES="300", WATCHLIST_MAX="150", DRY_RUN="true",
+    )
+    html, headers = await handle(FakeRequest("https://w.dev/prove"), env, fetch=_PollTG())
+    assert headers["status"] == 200
+    assert "الكشف يعمل" in html
+    assert "BTC" in html
+
+
+async def test_verdict_is_blind_when_nothing_was_ever_attempted():
+    from cta.health import verdict
+
+    v = verdict(source_health={}, counters={"cycles": 0}, last_cycle=None)
+    assert v["state"] == "BLIND"
+    assert "لم تُنفَّذ" in v["reason"]
+
+
+async def test_verdict_is_blind_when_every_venue_failed():
+    from cta.health import verdict
+
+    v = verdict(source_health={"hyperliquid": False, "dydx": False},
+                counters={"cycles": 12}, last_cycle=None)
+    assert v["state"] == "BLIND"
+
+
+async def test_verdict_is_watching_when_data_flows_and_nothing_fired():
+    from datetime import datetime, timezone
+
+    from cta.health import verdict
+
+    v = verdict(source_health={"hyperliquid": True},
+                counters={"cycles": 40},
+                last_cycle=datetime.now(timezone.utc).isoformat(),
+                signals=0)
+    assert v["state"] == "WATCHING"
+    assert v["reachable"] is True
+
+
+async def test_verdict_is_blind_when_the_last_cycle_went_stale():
+    from datetime import datetime, timedelta, timezone
+
+    from cta.health import verdict
+
+    old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    v = verdict(source_health={"hyperliquid": True}, counters={"cycles": 40}, last_cycle=old)
+    assert v["state"] == "BLIND"
+    assert "متوقفة" in v["reason"]
+
+
+async def test_prove_command_answers_in_the_chat():
+    from cta.bot import Bot
+    from cta.state import MemoryStore
+    from cta.telegram import Telegram
+
+    sent = []
+
+    async def sdk_fetch(resource, **options):
+        if resource.endswith("/sendMessage"):
+            sent.append(json.loads(options["body"]))
+        return _Resp({"ok": True, "result": {"message_id": 1}})
+
+    env = _env(
+        TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="555",
+        MIN_INDEPENDENT_TRADERS="2", MIN_ELITE_OR_PROVEN="2",
+        MIN_SIGNAL_SCORE="65", CONVERGENCE_WINDOW_MIN="90",
+        WATCHLIST_MIN_GRADE="PROVEN", ENTRY_TOLERANCE_BPS="50",
+        MAX_SLIPPAGE_BPS="50", MAX_MEDIAN_LEVERAGE="10",
+        DISCOVERY_MAX_CANDIDATES="300", WATCHLIST_MAX="150", DRY_RUN="true",
+    )
+    bot = Bot(Telegram(sdk_fetch, "1:x", "555"), MemoryStore(), env=env)
+    await bot.handle_update(_tg_update(chat_id=555, text="/prove"))
+
+    assert sent
+    assert "الكشف يعمل" in sent[0]["text"]
