@@ -1,0 +1,321 @@
+"""The production entry points: HTTP routing and the cycle orchestration.
+
+These are the paths that actually run on Cloudflare, so they get exercised with
+fake request objects rather than trusted by inspection.
+"""
+
+from __future__ import annotations
+
+import json
+
+from cta.config import Config
+from cta.runtime import (
+    handle_telegram_async,
+    run_cycle_async,
+    run_profile_async,
+    track_outcomes_async,
+)
+from cta.state import MemoryStore
+from cta.worker import handle, scheduled
+
+from .conftest import FakeEnv, FakeFetch
+
+
+class FakeRequest:
+    def __init__(self, url: str = "https://radar.workers.dev/health",
+                 method: str = "GET", payload=None, headers=None):
+        self.url = url
+        self.method = method
+        self._payload = payload if payload is not None else {}
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+
+def _body(result) -> dict:
+    text, headers = result
+    assert "application/json" in headers["content-type"]
+    return json.loads(text)
+
+
+def _env(**kw) -> FakeEnv:
+    env = FakeEnv(**kw)
+    env.STATE = MemoryStore()
+    return env
+
+
+# ── routing ──────────────────────────────────────────────────────────────────
+async def test_health_route():
+    env = _env()
+    result = await handle(FakeRequest("https://x.dev/health"), env, fetch=FakeFetch({}))
+    body = _body(result)
+    assert body["ok"] is True
+    assert body["watchlist"] == 0
+
+
+async def test_root_route_returns_html():
+    env = _env()
+    body, headers = await handle(FakeRequest("https://x.dev/"), env, fetch=FakeFetch({}))
+    assert "text/html" in headers["content-type"]
+    assert "HYPOTHETICAL" in body
+
+
+async def test_signals_route_lists_stored_signals():
+    env = _env()
+    await env.STATE.set("signals", [{"signal_id": "a"}, {"signal_id": "b"}])
+    body = _body(await handle(FakeRequest("https://x.dev/signals"), env, fetch=FakeFetch({})))
+    assert body["count"] == 2
+
+
+async def test_unknown_route_returns_404():
+    env = _env()
+    result = await handle(FakeRequest("https://x.dev/nope"), env, fetch=FakeFetch({}))
+    assert result[1]["status"] == 404
+
+
+async def test_owner_token_is_enforced():
+    env = _env(OWNER_TOKEN="secret")
+    request = FakeRequest("https://x.dev/kick", method="POST", headers={})
+    result = await handle(request, env, fetch=FakeFetch({}))
+    assert result[1]["status"] == 401
+
+
+async def test_owner_token_accepted_when_correct():
+    env = _env(OWNER_TOKEN="secret")
+    request = FakeRequest("https://x.dev/boot", method="POST",
+                          headers={"x-owner-token": "secret"})
+    result = await handle(request, env, fetch=FakeFetch({}))
+    assert result[1]["status"] == 200
+
+
+async def test_telegram_webhook_rejects_bad_secret():
+    env = _env(TELEGRAM_WEBHOOK_SECRET="s3cret", TELEGRAM_BOT_TOKEN="", TELEGRAM_CHAT_ID="")
+    request = FakeRequest("https://x.dev/telegram", method="POST",
+                          payload={"message": {"chat": {"id": 1}, "text": "/help"}},
+                          headers={"x-telegram-bot-api-secret-token": "wrong"})
+    result = await handle(request, env, fetch=FakeFetch({}))
+    assert result[1]["status"] == 403
+
+
+async def test_telegram_webhook_accepts_good_secret():
+    env = _env(TELEGRAM_WEBHOOK_SECRET="s3cret", TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="1")
+    request = FakeRequest("https://x.dev/telegram", method="POST",
+                          payload={"message": {"chat": {"id": 1}, "text": "/help"}},
+                          headers={"x-telegram-bot-api-secret-token": "s3cret"})
+    result = await handle(request, env, fetch=FakeFetch({"api.telegram.org": {"ok": True}}))
+    assert result[1]["status"] == 200
+
+
+async def test_route_errors_do_not_leak_stack_traces():
+    class ExplodingStore:
+        async def get(self, *a, **k):
+            raise RuntimeError("boom")
+
+        async def set(self, *a, **k):
+            raise RuntimeError("boom")
+
+        async def append(self, *a, **k):
+            raise RuntimeError("boom")
+
+    env = _env()
+    env.STATE = ExplodingStore()
+
+    result = await handle(FakeRequest("https://x.dev/health"), env, fetch=FakeFetch({}))
+    body = _body(result)
+    assert result[1]["status"] == 500
+    assert "boom" in body["error"]
+    assert "Traceback" not in body["error"]
+
+
+# ── runtime cycles ───────────────────────────────────────────────────────────
+def _hl_routes(positions_payload=None, fills_payload=None, prices=None, leaderboard=None):
+    return {
+        "/info": lambda: _info_payload(positions_payload, fills_payload, prices),
+        "leaderboard": leaderboard or {"leaderboardRows": []},
+    }
+
+
+def _info_payload(positions_payload, fills_payload, prices):
+    return positions_payload or fills_payload or prices or {"BTC": "65000"}
+
+
+async def test_run_cycle_reports_health_and_counts():
+    env = _env(TELEGRAM_BOT_TOKEN="", TELEGRAM_CHAT_ID="")
+    env.STATE = MemoryStore()
+    fetch = FakeFetch({
+        "leaderboard": {"leaderboardRows": []},
+        "/info": {"BTC": "65000"},
+    })
+    report = await run_cycle_async(env, fetch, Config())
+    assert report["ok"] is True
+    assert "source_health" in report
+    assert report["signals"] == 0
+
+
+async def test_run_cycle_never_raises_on_venue_outage():
+    env = _env()
+    fetch = FakeFetch({})  # every venue 404s
+    report = await run_cycle_async(env, fetch, Config())
+    assert report["ok"] is True
+    assert all(v is False for v in report["source_health"].values())
+
+
+async def test_run_profile_with_no_leaderboard_produces_empty_watchlist():
+    env = _env()
+    fetch = FakeFetch({"leaderboard": {"leaderboardRows": []}})
+    result = await run_profile_async(env, fetch, Config())
+    assert result["ok"] is True
+    assert result["watchlist"] == 0
+
+
+async def test_track_outcomes_without_signals_is_safe():
+    env = _env()
+    fetch = FakeFetch({"/info": {"BTC": "65000"}})
+    result = await track_outcomes_async(env, fetch, Config())
+    assert result["ok"] is True
+    assert result["evaluated"] == 0
+
+
+async def test_track_outcomes_scores_a_stored_signal():
+    env = _env()
+    store = env.STATE
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    await store.set("signals", [{
+        "signal_id": "s1", "coin": "BTC", "side": "LONG", "entry_center": 65_000,
+        "created_at": (now - timedelta(hours=6)).isoformat(),
+        "plan": {"entry": 65_000, "stop": 63_000, "target": 67_000},
+    }])
+    fetch = FakeFetch({"/info": {"BTC": "68000"}})
+
+    result = await track_outcomes_async(env, fetch, Config())
+    assert result["evaluated"] == 1
+    assert result["hit_target"] == 1
+
+    stats = await store.get("stats")
+    assert stats["evaluated"] == 1
+
+
+async def test_telegram_handler_runs_a_command():
+    env = _env(TELEGRAM_BOT_TOKEN="t", TELEGRAM_CHAT_ID="1")
+    fetch = FakeFetch({"api.telegram.org": {"ok": True}})
+    result = await handle_telegram_async(
+        env, fetch, {"message": {"chat": {"id": 1}, "text": "/help"}}
+    )
+    assert result["handled"] is True
+
+
+async def test_scheduled_runs_a_cycle():
+    env = _env()
+    fetch = FakeFetch({"leaderboard": {"leaderboardRows": []}, "/info": {"BTC": "65000"}})
+    result = await scheduled(env, fetch=fetch)
+    assert result["ok"] is True
+
+
+# ── ai integration through the bot ───────────────────────────────────────────
+async def test_bot_uses_ai_when_available():
+    from cta.bot import Bot
+    from cta.telegram import Telegram
+
+    class FakeAI:
+        async def run(self, model, payload):
+            return {"response": "إجابة من النموذج"}
+
+    env = _env(AI=FakeAI())
+    store = MemoryStore()
+    bot = Bot(Telegram(FakeFetch({}), "t", "1"), store, env=env, cfg=Config())
+    answer = await bot._converse("ما رأيك؟", "1")
+    assert answer == "إجابة من النموذج"
+
+
+async def test_bot_falls_back_when_ai_disabled():
+    from cta.bot import Bot
+    from cta.telegram import Telegram
+
+    class FakeAI:
+        async def run(self, model, payload):  # pragma: no cover - must not be called
+            raise AssertionError("AI should not be called when disabled")
+
+    env = _env(AI=FakeAI())
+    bot = Bot(Telegram(FakeFetch({}), "t", "1"), MemoryStore(), env=env,
+              cfg=Config(ai_enabled=False))
+    answer = await bot._converse("كيف الحال؟", "1")
+    assert isinstance(answer, str) and answer
+
+
+async def test_dash_route_renders_live_dashboard():
+    env = _env()
+    await env.STATE.set("watchlist", [
+        {"wallet": "0xabc", "source": "hyperliquid", "grade": "ELITE", "score": 92,
+         "n_trades": 300, "profit_factor": 2.4, "max_drawdown": 0.08},
+    ])
+    await env.STATE.set("source_health", {"hyperliquid": True})
+    await env.STATE.set("last_cycle_at", "2026-11-12T10:00:00+00:00")
+
+    body, headers = await handle(FakeRequest("https://x.dev/dash"), env, fetch=FakeFetch({}))
+
+    assert "text/html" in headers["content-type"]
+    assert 'dir="rtl"' in body
+    assert "0xabc" in body
+    assert "2026-11-12" in body
+    # A reachable venue must flip the banner to live, not demo.
+    assert "بيانات حيّة" in body
+
+
+async def test_dash_before_first_cycle_says_nothing_happened():
+    """Empty state is honest: no invented numbers, still a usable page."""
+    body, _ = await handle(FakeRequest("https://x.dev/dash"), _env(), fetch=FakeFetch({}))
+    assert "عرض تجريبي" in body or "لا توجد إشارات" in body
+    assert "HYPOTHETICAL_" in body
+
+
+async def test_dash_shows_why_clusters_were_rejected():
+    env = _env()
+    await env.STATE.set("last_rejections", [
+        {"coin": "SOL", "side": "LONG", "reason": "انتشار واسع 2.4%"},
+    ])
+    body, _ = await handle(FakeRequest("https://x.dev/dash"), env, fetch=FakeFetch({}))
+    assert "SOL" in body
+    assert "انتشار واسع" in body
+
+
+# ── entrypoint ──────────────────────────────────────────────────────────────
+# entry.py is the only file Cloudflare actually invokes. It must expose the
+# class-based handler (current runtime) and still delegate to cta.worker.
+async def test_entry_default_class_delegates_fetch():
+    import entry
+
+    env = _env()
+    called = {}
+
+    class Recorder:
+        async def fetch(self, request, env=None, ctx=None):
+            called["ok"] = True
+            return await handle(request, env or self.env, ctx)
+
+    assert hasattr(entry, "Default")
+    rec = Recorder()
+    rec.env = env
+    await rec.fetch(FakeRequest("https://x.dev/health"), env)
+    assert called["ok"] is True
+
+
+async def test_entry_scheduled_is_exposed():
+    """The cron trigger resolves `scheduled`; a missing one silently stops scans."""
+    import entry
+
+    assert hasattr(entry, "Default")
+    assert hasattr(entry.Default, "scheduled")
+    assert callable(entry.on_scheduled)
+
+
+async def test_entry_class_fetch_uses_self_env_when_not_passed():
+    """Cloudflare calls `fetch(request)` only; env comes from the instance."""
+    import entry
+
+    env = _env()
+    worker = entry.Default(None, env)
+    body = _body(await worker.fetch(FakeRequest("https://x.dev/health")))
+    assert body["ok"] is True
