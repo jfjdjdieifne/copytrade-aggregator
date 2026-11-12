@@ -6,6 +6,7 @@ POST /telegram   Telegram webhook (secret-token protected)
 GET  /            short status page, safe to hit in a browser
 GET  /health      JSON health for uptime checks
 GET  /signals     last signals as JSON
+GET  /dash        full Arabic dashboard with the live state the cron built
 POST /kick        run one cycle now (owner token required)
 POST /refresh     rebuild the watchlist now (owner token required)
 POST /boot        first-run setup: webhook + watchlist (owner token required)
@@ -24,6 +25,7 @@ from .runtime import (
     run_profile_async,
     track_outcomes_async,
 )
+from .dashboard import render_dashboard
 from .state import get_signals, get_watchlist, store_from_env
 
 JSON_HEADERS = {
@@ -99,6 +101,35 @@ def _default_fetch(env):
         )
 
 
+async def _dashboard_html(store) -> str:
+    """Render the live dashboard from whatever the last cron cycle stored.
+
+    Everything here comes out of the Durable Object, so this page is a window on
+    real state — not a re-run of a scenario. If a cycle has not completed yet the
+    page says so rather than showing invented numbers.
+    """
+    watchlist = await get_watchlist(store)
+    signals = await get_signals(store)
+    last = await store.get("last_cycle_at")
+    health = await store.get("source_health", {}) or {}
+    rejections = await store.get("last_rejections", []) or []
+    counters = await store.get("counters", {}) or {}
+
+    return render_dashboard(
+        signals[-20:],
+        watchlist,
+        {
+            "cycles": counters.get("cycles", 0),
+            "clusters": counters.get("clusters", 0),
+            "signals": counters.get("signals", 0),
+        },
+        rejections,
+        live=bool(health) and any(health.values()),
+        source_health=health,
+        last_cycle=last,
+    )
+
+
 async def handle(request, env, ctx=None, fetch=None):
     """Single entrypoint for every HTTP request."""
     fetcher = fetch or _default_fetch(env)
@@ -118,18 +149,9 @@ async def handle(request, env, ctx=None, fetch=None):
             result = await handle_telegram_async(env, fetcher, update)
             return _json(result)
 
-        if path in ("/", "/status"):
+        if path in ("/", "/status", "/dash"):
             store = store_from_env(env)
-            watchlist = await get_watchlist(store)
-            signals = await get_signals(store)
-            last = await store.get("last_cycle_at", "—")
-            html = (
-                "<h1>Cop-Trade Aggregator — Radار</h1>"
-                f"<p>watchlist: <b>{len(watchlist)}</b></p>"
-                f"<p>signals stored: <b>{len(signals)}</b></p>"
-                f"<p>last cycle: <b>{last}</b></p>"
-                "<p>HYPOTHETICAL_ — not financial advice.</p>"
-            )
+            html = await _dashboard_html(store)
             return (html, {"status": 200, "content-type": "text/html; charset=utf-8"})
 
         if path == "/health":

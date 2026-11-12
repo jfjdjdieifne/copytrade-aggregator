@@ -243,3 +243,39 @@ async def test_bot_falls_back_when_ai_disabled():
               cfg=Config(ai_enabled=False))
     answer = await bot._converse("كيف الحال؟", "1")
     assert isinstance(answer, str) and answer
+
+
+async def test_dash_route_renders_live_dashboard():
+    env = _env()
+    await env.STATE.set("watchlist", [
+        {"wallet": "0xabc", "source": "hyperliquid", "grade": "ELITE", "score": 92,
+         "n_trades": 300, "profit_factor": 2.4, "max_drawdown": 0.08},
+    ])
+    await env.STATE.set("source_health", {"hyperliquid": True})
+    await env.STATE.set("last_cycle_at", "2026-11-12T10:00:00+00:00")
+
+    body, headers = await handle(FakeRequest("https://x.dev/dash"), env, fetch=FakeFetch({}))
+
+    assert "text/html" in headers["content-type"]
+    assert 'dir="rtl"' in body
+    assert "0xabc" in body
+    assert "2026-11-12" in body
+    # A reachable venue must flip the banner to live, not demo.
+    assert "بيانات حيّة" in body
+
+
+async def test_dash_before_first_cycle_says_nothing_happened():
+    """Empty state is honest: no invented numbers, still a usable page."""
+    body, _ = await handle(FakeRequest("https://x.dev/dash"), _env(), fetch=FakeFetch({}))
+    assert "عرض تجريبي" in body or "لا توجد إشارات" in body
+    assert "HYPOTHETICAL_" in body
+
+
+async def test_dash_shows_why_clusters_were_rejected():
+    env = _env()
+    await env.STATE.set("last_rejections", [
+        {"coin": "SOL", "side": "LONG", "reason": "انتشار واسع 2.4%"},
+    ])
+    body, _ = await handle(FakeRequest("https://x.dev/dash"), env, fetch=FakeFetch({}))
+    assert "SOL" in body
+    assert "انتشار واسع" in body

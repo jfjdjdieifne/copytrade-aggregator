@@ -247,10 +247,24 @@ async def scan(
 
     seen = set(await store.get("seen_signal_ids", []) or [])
     emitted: list[Signal] = []
+    rejected: list[dict] = []
     for cluster in clusters:
         price = prices.get(cluster.coin)
         sig = build_signal(cluster, cfg, market_price=price, now=now)
         if sig is None:
+            # Record *why* a cluster died. "No signal" with no explanation is the
+            # single least trustworthy thing a monitoring system can report.
+            conf = score_cluster(cluster, cfg)
+            reason = (conf.reasons or ["لم تجتز شروط الجودة"])[0]
+            rejected.append(
+                {
+                    "coin": cluster.coin,
+                    "side": cluster.side,
+                    "n_independent": cluster.n_members,
+                    "score": conf.total,
+                    "reason": reason,
+                }
+            )
             continue
         if sig.signal_id in seen:
             continue
@@ -258,6 +272,11 @@ async def scan(
         emitted.append(sig)
 
     await store.set("seen_signal_ids", sorted(seen)[-500:])
+    if rejected:
+        try:
+            await store.set("last_rejections", rejected[-40:])
+        except Exception:
+            pass
     return emitted, clusters
 
 

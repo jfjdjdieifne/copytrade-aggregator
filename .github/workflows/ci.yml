@@ -38,6 +38,7 @@ jobs:
           PYTHONPATH=src python -c "
           import cta, cta.engine, cta.worker, cta.runtime, cta.cli, cta.bot, cta.ai, cta.state
           import cta.sources, cta.convergence, cta.confidence, cta.classifier, cta.plan
+          import cta.dashboard, cta.preview_server, cta.durable_object
           print('all modules import cleanly — version', cta.__version__)
           "
 

@@ -28,11 +28,23 @@ UTC = timezone.utc
 NOW = datetime.now(UTC)
 
 
-def _synthetic_fills(wallet: str, edge: float, n: int = 260, days: int = 420) -> list[Fill]:
+def _synthetic_fills(
+    wallet: str,
+    edge: float,
+    n: int = 260,
+    days: int = 420,
+    win_rate: float = 0.74,
+    loss_mult: float = 1.0,
+) -> list[Fill]:
     """Reproducible pseudo-random fills with a controlled edge.
 
     Deterministic by construction: a linear congruential generator seeded from the
     wallet string, so every run prints identical numbers.
+
+    `win_rate` and `loss_mult` widen the generator beyond "one very good trader":
+    the defaults reproduce the original distribution exactly, while shifting them
+    down lets a scenario roster span ELITE / PROVEN / WATCH / REJECT instead of
+    grading every wallet identically.
     """
     seed = sum(ord(c) for c in wallet) or 7
     state = seed
@@ -46,10 +58,10 @@ def _synthetic_fills(wallet: str, edge: float, n: int = 260, days: int = 420) ->
 
         # A tradable edge: ~62% wins worth ~2x the average loss. Deterministic, and
         # it produces the profit factor / drawdown a real proven trader would show.
-        if noise > -0.24:
+        if noise > 0.5 - win_rate:
             pnl = edge * (1.6 + abs(noise) * 0.8)
         else:
-            pnl = -edge * (1.0 + abs(noise) * 0.4)
+            pnl = -edge * (1.0 + abs(noise) * 0.4) * loss_mult
 
         fills.append(
             Fill(

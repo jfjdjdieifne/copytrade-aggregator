@@ -109,18 +109,28 @@ def stats_from_fills(
     data_confirmed: bool = True,
     avg_hold_hours: float = 0.0,
     max_leverage: float = 0.0,
+    grade: bool = True,
 ) -> TraderStats:
-    """Derive every metric the classifier needs from raw fills."""
+    """Derive every metric the classifier needs from raw fills.
+
+    Grading happens here by default. Returning a `TraderStats` whose `grade` is
+    still the "REJECT" placeholder was a footgun: any caller that skipped the
+    explicit `classify_trader` step silently got un-graded traders, and every
+    convergence check downstream then failed for the wrong reason.
+    """
     closed = [f for f in fills if f.closed_pnl != 0.0]
     n = len(closed)
     if n == 0:
-        return TraderStats(
+        empty = TraderStats(
             wallet=wallet,
             source=source,
             account_value_usd=account_value_usd,
             data_confirmed=data_confirmed,
             reasons=["لا توجد صفقات مغلقة"],
         )
+        empty.grade = "REJECT"
+        empty.score = 0
+        return empty
 
     wins = [f.closed_pnl for f in closed if f.closed_pnl > 0]
     losses = [f.closed_pnl for f in closed if f.closed_pnl < 0]
@@ -135,7 +145,7 @@ def stats_from_fills(
     times = [f.time_ms for f in closed]
     active_days = max(0, int((max(times) - min(times)) / 86_400_000))
 
-    return TraderStats(
+    stats = TraderStats(
         wallet=wallet,
         n_trades=n,
         win_rate=len(wins) / n,
@@ -157,6 +167,9 @@ def stats_from_fills(
         source=source,
         data_confirmed=data_confirmed,
     )
+    if grade:
+        classify_trader(stats)
+    return stats
 
 
 # ── scoring ──────────────────────────────────────────────────────────────────

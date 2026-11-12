@@ -12,7 +12,14 @@ pip install -e ".[dev]"
 pytest -q
 ```
 
-✅ **النجاح:** `146 passed`
+✅ **النجاح:** `167 passed`
+
+**تحقّق بصري (لا يحتاج كمبيوتر):**
+```bash
+python -m cta.preview_server --host 0.0.0.0 --port 8000
+```
+افتح المنفذ من الجوال → يجب أن ترى لوحة عربية فيها إشارة BTC واضحة، وشريط 🟡 يقول «عرض تجريبي».
+
 
 ```bash
 python -m cta.cli demo
