@@ -170,13 +170,26 @@ async def _dashboard_html(store, base_url: str = "") -> str:
 
 
 async def handle(request, env, ctx=None, fetch=None):
-    """Single entrypoint for every HTTP request."""
-    fetcher = fetch or _default_fetch(env)
+    """Single entrypoint for every HTTP request.
 
+    Everything that can fail is inside the try, including resolving the fetch
+    implementation. A failure outside it surfaces as Cloudflare's Error 1101 —
+    an anonymous "Worker threw exception" page with no detail — which is what a
+    live deployment produced when the entrypoint could not see its bindings.
+    """
+    try:
+        fetcher = fetch or _default_fetch(env)
+        return await _dispatch(request, env, ctx, fetcher)
+    except Exception as exc:  # never leak a stack trace to the web
+        return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}, 500)
+
+
+async def _dispatch(request, env, ctx, fetcher):
+    """Route one request. All routes live here so one try/except covers them."""
     path = _path(request)
     method = _method(request)
 
-    try:
+    if True:  # keeps the route bodies at their original indentation
         if path == "/telegram" and method == "POST":
             expected_secret = getattr(env, "TELEGRAM_WEBHOOK_SECRET", "") or ""
             if expected_secret:
@@ -289,9 +302,6 @@ async def handle(request, env, ctx=None, fetch=None):
             return _json(await boot_async(env, fetcher))
 
         return _json({"ok": False, "error": f"no route for {method} {path}"}, 404)
-
-    except Exception as exc:  # never leak a stack trace to Telegram or the web
-        return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}, 500)
 
 
 async def scheduled(env, ctx=None, fetch=None):

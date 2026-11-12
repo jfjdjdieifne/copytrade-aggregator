@@ -48,15 +48,61 @@ except Exception:  # pragma: no cover - local test runs and plain CPython
 
 
 class Default(WorkerEntrypoint):
-    """Primary entrypoint: HTTP routes and the cron trigger."""
+    """Primary entrypoint: HTTP routes and the cron trigger.
+
+    `__init__` is declared explicitly on purpose. The SDK's `_wrap_class` turns
+    the constructor into `wrapped_init(self, *args)`, and binds the bindings
+    object as **args[1]** — after wrapping it in `_EnvWrapper`:
+
+        if len(args) > 1:
+            args[1] = _EnvWrapper(args[1])
+
+    A subclass with no `__init__` of its own never accepts that second argument,
+    so `self.env` stays None and every route that touches state raises. That is
+    exactly the Error 1101 this deployment produced. Declaring the parameter
+    here is what makes the binding reach us.
+    """
+
+    def __init__(self, ctx, env):
+        self.ctx = ctx
+        self.env = env
 
     async def fetch(self, request, env=None, ctx=None):
-        return await handle(request, env or self.env, ctx or self.ctx)
+        # The runtime calls fetch(request); env is already on the instance.
+        # The try/except here is the last line of defence: anything that escapes
+        # becomes Cloudflare's Error 1101 — an anonymous page with no message —
+        # so a failure must be rendered as text the operator can act on.
+        try:
+            return await handle(
+                request,
+                env if env is not None else getattr(self, "env", None),
+                ctx if ctx is not None else getattr(self, "ctx", None),
+            )
+        except Exception as exc:
+            return _crash_page(exc)
 
     async def scheduled(self, controller=None, env=None, ctx=None):
-        # The class-based runtime calls `scheduled(controller, env, ctx)`; the
-        # env is always supplied, so the defaults below only matter in tests.
-        return await scheduled(env or self.env, ctx)
+        # Called as scheduled(controller, env, ctx); env is bound on the instance
+        # already, so never trust the positional args here.
+        return await scheduled(self.env, self.ctx)
+
+
+def _crash_page(exc: Exception):
+    """Explain a fatal error in one paragraph instead of a blank 1101 page."""
+    import json as _json
+    import traceback
+
+    body = _json.dumps(
+        {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+            "where": traceback.format_exc().splitlines()[-3:],
+            "hint": "افتح Workers Logs لرؤية التتبع الكامل",
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+    return (body, {"status": 500, "content-type": "application/json; charset=utf-8"})
 
 
 # ── Durable Object ──────────────────────────────────────────────────────────
