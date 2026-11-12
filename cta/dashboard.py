@@ -369,6 +369,8 @@ def render_setup_page(
     token_ok: bool = True,
     token_error: str = "",
     pending_updates: int = 0,
+    owner_linked: bool = False,
+    ai_binding: bool = True,
 ) -> str:
     """Human-readable first-run page.
 
@@ -422,12 +424,12 @@ def render_setup_page(
             "هذه الصفحة نفسها دليل: الخادم استجاب لطلبك.",
         ),
         step(
-            "done" if chat_id_set else "todo",
-            "رقم محادثتك (TELEGRAM_CHAT_ID)",
-            "مضبوط." if chat_id_set else
-            "غير مضبوط — أضفه من Settings ← Variables and Secrets. "
-            "بدونه البوت يرد على أي شخص، ومع خطر استهلاك حصة الذكاء الاصطناعي.",
-            "" if chat_id_set else "خذه من @userinfobot في تلغرام",
+            "done" if owner_linked else "todo",
+            "مالك البوت",
+            "مربوط." if owner_linked else
+            "يُربط تلقائياً: افتح بوتك وأرسل <b>/start</b> — أول محادثة تصبح المالكة. "
+            "لا تحتاج أي إعداد يدوي.",
+            "",
         ),
         step(
             "done" if ok else "todo",
@@ -532,5 +534,109 @@ def render_state_error(reason: str, base_url: str = "") -> str:
   {setup}
   <p class="foot">HYPOTHETICAL_ — تحليل آلي، ليس نصيحة مالية.</p>
 </div>
+</body>
+</html>"""
+
+
+def render_selftest(report: dict, base_url: str = "") -> str:
+    """One screen that answers "is it actually working?" without waiting.
+
+    The old flow was: deploy, send /start, and hope. When nothing arrived there
+    was nothing to inspect, and each guess cost a redeploy. This renders the
+    platform's own answers — every row is a value the platform returned, not an
+    inference — so a passing page means the pipeline works end to end.
+    """
+    checks = report.get("checks", {}) or {}
+
+    titles = {
+        "state": "الذاكرة (حفظ وقراءة)",
+        "fetch": "الاتصال بالإنترنت",
+        "token": "صلاحية توكن البوت",
+        "webhook": "ربط تلغرام بالـ Worker",
+        "send": "إرسال رسالة فعلية",
+        "ai": "الذكاء الاصطناعي",
+        "clock": "الوقت",
+    }
+    hints = {
+        "state": "لو فشلت، اللوحة ستعرض أصفاراً غير حقيقية — هذا أهم فحص.",
+        "fetch": "لو فشلت، لا شيء يصل للمنصات ولا لتلغرام.",
+        "token": "لو فشلت، خذ توكناً جديداً من @BotFather.",
+        "webhook": "لو فشلت، افتح /setup مرة واحدة وسيُصلح نفسه.",
+        "send": "لو فشلت، أرسل /start للبوت أولاً ليصبح مالكاً.",
+        "ai": "بدونه يشرح النظام بجُمل جاهزة بدل صياغة حرة — لا يعطّل شيئاً.",
+        "clock": "للمطابقة مع سجلات كلاودفلير.",
+    }
+
+    rows = []
+    for key in ("state", "fetch", "token", "webhook", "send", "ai", "clock"):
+        c = checks.get(key, {})
+        ok = c.get("ok")
+        mark = "✅" if ok else "❌"
+        detail = c.get("detail", "") or ""
+        extra = ""
+        if key == "token" and c.get("bot_username"):
+            extra = f"@{c['bot_username']}"
+        elif key == "webhook":
+            extra = c.get("url", "") or "غير مسجّل"
+            if c.get("pending"):
+                extra += f" · {c['pending']} معلّقة"
+        elif key == "send" and c.get("chat_id"):
+            extra = c.get("chat_id", "")
+        elif key == "ai" and c.get("model"):
+            extra = c.get("model", "")
+        elif key == "state":
+            extra = c.get("backend", "")
+        elif key == "clock":
+            extra = c.get("utc", "")
+
+        rows.append(
+            f'<div class="row {("ok" if ok else "no")}">'
+            f'<span class="mark">{mark}</span>'
+            f'<div><div class="t">{html.escape(titles[key])}</div>'
+            f'<div class="d">{html.escape(extra)}</div>'
+            + (f'<div class="h">{html.escape(detail)}</div>' if detail else "")
+            + (f'<div class="hint">{html.escape(hints[key])}</div>' if not ok else "")
+            + "</div></div>"
+        )
+
+    all_ok = report.get("ok")
+    hero = (
+        '<div class="hero good"><b>✅ كل شيء يعمل</b>'
+        "الفحوصات السبعة نجحت. أرسل /help إلى بوتك وسيرد عليك.</div>"
+        if all_ok
+        else '<div class="hero bad"><b>⚠️ في شيء لا يعمل</b>'
+        "السبب مكتوب تحت كل فحص فاشل. أعد تحميل الصفحة بعد أي إصلاح.</div>"
+    )
+
+    dash = (
+        f'<p><a class="btn" href="{html.escape(base_url)}/dash">اللوحة الحيّة</a> '
+        f'<a class="btn" href="{html.escape(base_url)}/setup">إعداد تلغرام</a></p>'
+        if base_url
+        else ""
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>فحص النظام</title>
+<style>{_SETUP_CSS}
+.row{{display:flex;gap:10px;padding:12px 14px;border-radius:10px;margin:8px 0;
+background:#141a21;border:1px solid #232c36}}
+.row.ok{{border-color:#1e4d2b}} .row.no{{border-color:#6b2525}}
+.row .mark{{font-size:18px}} .row .t{{font-weight:700;margin-bottom:2px}}
+.row .d{{font-size:12px;color:#8fa3b8;direction:ltr;text-align:right;word-break:break-all}}
+.row .h{{font-size:12px;color:#ffb4b4;margin-top:6px;direction:ltr;text-align:right}}
+.row .hint{{font-size:12px;color:#f2cf72;margin-top:6px}}
+</style>
+</head>
+<body>
+<h1>🧪 فحص النظام</h1>
+{hero}
+{''.join(rows)}
+{dash}
+<p class="foot">HYPOTHETICAL_ — تحليل آلي، ليس نصيحة مالية.</p>
 </body>
 </html>"""

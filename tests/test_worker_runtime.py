@@ -1160,3 +1160,336 @@ async def test_telegram_posts_a_json_body_and_method():
     assert init["method"] == "POST"
     assert "\"chat_id\": \"999\"" in init["body"] or '"chat_id": "999"' in init["body"]
     assert init["headers"]["content-type"] == "application/json"
+
+
+# ── calling out: the SDK's fetch is keyword-only ─────────────────────────────
+async def test_adapter_bridges_the_sdk_keyword_only_fetch():
+    """The live failure, reproduced.
+
+    workers-py:  async def fetch(resource, **other_options)
+    our callers: fetch(url, {"method": "POST", ...})
+
+    -> TypeError: fetch() takes 1 positional argument but 2 were given
+    which /setup reported as "⚠️ التوكن غير صالح". The token was fine.
+    """
+    from cta.http_bridge import as_fetcher
+
+    seen = {}
+
+    async def sdk_fetch(resource, **other_options):  # verbatim shape
+        seen["resource"] = resource
+        seen["options"] = other_options
+        return "response"
+
+    fetch = as_fetcher(sdk_fetch)
+    result = await fetch("https://api.telegram.org/bot1/getMe", {"method": "POST"})
+    assert result == "response"
+    assert seen["resource"].endswith("/getMe")
+    assert seen["options"]["method"] == "POST"
+
+
+async def test_adapter_leaves_a_dict_style_fetch_alone():
+    """Tests and the preview server use (url, dict); do not break them."""
+    from cta.http_bridge import as_fetcher
+
+    async def dict_fetch(url, init=None):
+        return init["method"]
+
+    assert await as_fetcher(dict_fetch)("https://x.dev", {"method": "POST"}) == "POST"
+
+
+async def test_adapter_does_not_retry_a_type_error_raised_inside_fetch():
+    """Only the call itself may fall back; a real failure must surface once."""
+    import pytest
+
+    from cta.http_bridge import as_fetcher
+
+    calls = []
+
+    async def sdk_fetch(resource, **other_options):
+        calls.append(resource)
+        raise TypeError("something deep inside fetch exploded")
+
+    with pytest.raises(TypeError, match="deep inside"):
+        await as_fetcher(sdk_fetch)("https://x.dev", {"method": "POST"})
+    assert len(calls) == 1
+
+
+async def test_adapter_is_idempotent():
+    from cta.http_bridge import as_fetcher
+
+    async def f(url, init=None):
+        return 1
+
+    once = as_fetcher(f)
+    assert as_fetcher(once) is once
+
+
+async def test_telegram_works_against_a_keyword_only_fetch():
+    """End-to-end: the exact call that failed live."""
+    from cta.http_bridge import as_fetcher
+    from cta.telegram import Telegram
+
+    calls = []
+
+    async def sdk_fetch(resource, **other_options):
+        calls.append((resource, other_options))
+
+        class R:
+            status = 200
+
+            async def json(self):
+                return {"ok": True, "result": {"message_id": 5, "username": "copytrader99_bot"}}
+
+        return R()
+
+    tg = Telegram(as_fetcher(sdk_fetch), "9262437260:AAE-test")
+    assert (await tg.call("getMe", {}))["ok"] is True
+    assert (await tg.send("hi", "123"))["ok"] is True
+    assert calls[0][0].endswith("/getMe")
+    assert calls[1][0].endswith("/sendMessage")
+    assert calls[1][1]["method"] == "POST"
+    assert '"chat_id"' in calls[1][1]["body"]
+
+
+async def test_handle_normalises_the_fetch_before_dispatch():
+    """/setup must survive a keyword-only fetch; it is the first thing opened."""
+    from cta.worker import handle
+
+    async def sdk_fetch(resource, **other_options):
+        method = resource.rsplit("/", 1)[-1]
+
+        class R:
+            status = 200
+
+            async def json(self):
+                if method == "getMe":
+                    return {"ok": True, "result": {"id": 1, "username": "copytrader99_bot"}}
+                if method == "getWebhookInfo":
+                    return {"ok": True, "result": {"url": "https://w.dev/telegram",
+                                                   "pending_update_count": 0}}
+                return {"ok": True, "result": True}
+
+        return R()
+
+    env = _env(TELEGRAM_BOT_TOKEN="9262437260:AAE-test", WORKER_URL="https://w.dev")
+    body = _body(await handle(FakeRequest("https://w.dev/setup.json"), env, fetch=sdk_fetch))
+    assert body["token_ok"] is True
+    assert body["bot_username"] == "copytrader99_bot"
+    assert body["ok"] is True
+
+
+# ── zero-config ownership: no TELEGRAM_CHAT_ID needed ────────────────────────
+class _TGAny:
+    """Telegram that accepts anything and records sends."""
+
+    def __init__(self, username="copytrader99_bot", webhook_url=""):
+        self.username = username
+        self.webhook_url = webhook_url
+        self.sent = []
+        self.registered = []
+
+    async def __call__(self, url, init=None, **kw):
+        method = url.rsplit("/", 1)[-1]
+        body = {}
+        if isinstance(init, dict) and init.get("body"):
+            body = json.loads(init["body"])
+
+        class R:
+            status = 200
+
+            def __init__(self, payload):
+                self._p = payload
+
+            async def json(self):
+                return self._p
+
+            async def text(self):
+                return json.dumps(self._p)
+
+        if method == "getMe":
+            return R({"ok": True, "result": {"id": 1, "username": self.username}})
+        if method == "sendMessage":
+            self.sent.append(body)
+            return R({"ok": True, "result": {"message_id": len(self.sent)}})
+        if method == "setWebhook":
+            self.registered.append(body.get("url"))
+            self.webhook_url = body.get("url", "")
+            return R({"ok": True, "result": True})
+        if method == "getWebhookInfo":
+            return R({"ok": True, "result": {"url": self.webhook_url,
+                                             "pending_update_count": 0}})
+        return R({"ok": True, "result": True})
+
+
+def _tg_update(chat_id=555, text="/start"):
+    return {
+        "update_id": 1,
+        "message": {
+            "message_id": 10,
+            "date": 1700000000,
+            "chat": {"id": chat_id, "type": "private"},
+            "from": {"id": chat_id, "is_bot": False, "first_name": "Owner"},
+            "text": text,
+        },
+    }
+
+
+async def test_first_chat_claims_ownership_automatically():
+    """No TELEGRAM_CHAT_ID: the first person to message becomes the owner.
+
+    This removes the step that was failing, and removes the trap where the bot's
+    own id (which BotFather prints) was pasted in and locked out the real owner.
+    """
+    from cta.runtime import handle_telegram_async
+    from cta.state import KEY_OWNER_CHAT
+    from cta.state import store_from_env
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    tg = _TGAny()
+
+    result = await handle_telegram_async(env, tg, _tg_update(chat_id=555))
+    assert result["handled"] is True
+    assert await store_from_env(env).get(KEY_OWNER_CHAT) == "555"
+    joined = " ".join(m.get("text", "") for m in tg.sent)
+    assert "تم ربط هذه المحادثة" in joined
+
+
+async def test_a_second_chat_is_refused_after_the_claim():
+    """The claim is sticky: one bot, one owner — the AI budget is protected."""
+    from cta.runtime import handle_telegram_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    tg = _TGAny()
+
+    await handle_telegram_async(env, tg, _tg_update(chat_id=555))
+    result = await handle_telegram_async(env, tg, _tg_update(chat_id=666))
+    assert result["handled"] is False
+    assert result["reason"] == "chat not allowed"
+
+
+async def test_whoami_answers_even_when_ownership_is_wrong():
+    """A mistyped TELEGRAM_CHAT_ID must remain diagnosable."""
+    from cta.runtime import handle_telegram_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="999999")
+    tg = _TGAny()
+
+    result = await handle_telegram_async(env, tg, _tg_update(chat_id=555, text="/whoami"))
+    assert result["handled"] is True
+    assert result["kind"] == "whoami"
+    # and the refused message deliberately does NOT reveal the owner id
+    refused = await handle_telegram_async(env, tg, _tg_update(chat_id=555, text="/help"))
+    assert refused["handled"] is False
+
+
+async def test_an_explicit_chat_id_still_wins():
+    from cta.runtime import handle_telegram_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="555")
+    tg = _TGAny()
+    assert (await handle_telegram_async(env, tg, _tg_update(chat_id=555)))["handled"] is True
+    assert (await handle_telegram_async(env, tg, _tg_update(chat_id=777)))["handled"] is False
+
+
+# ── the webhook registers itself ─────────────────────────────────────────────
+async def test_cron_registers_the_webhook_without_visiting_setup():
+    from cta.runtime import ensure_webhook_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    tg = _TGAny(webhook_url="")
+    result = await ensure_webhook_async(env, tg, "https://w.dev")
+    assert result["ok"] is True
+    assert result["changed"] is True
+    assert tg.registered == ["https://w.dev/telegram"]
+
+
+async def test_cron_does_not_reregister_when_already_correct():
+    """The cron runs 1,440 times a day; do not burn requests."""
+    from cta.runtime import ensure_webhook_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    tg = _TGAny(webhook_url="https://w.dev/telegram")
+    result = await ensure_webhook_async(env, tg, "https://w.dev")
+    assert result["ok"] is True
+    assert result["changed"] is False
+    assert tg.registered == []
+
+
+async def test_setup_remembers_the_url_so_the_cron_can_reuse_it():
+    """/setup is the only place the real public URL is learned."""
+    from cta.state import KEY_PUBLIC_BASE, store_from_env
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", WORKER_URL="")
+    await handle(FakeRequest("https://real-host.workers.dev/setup.json"), env, fetch=_TGAny())
+    assert await store_from_env(env).get(KEY_PUBLIC_BASE) == "https://real-host.workers.dev"
+
+
+# ── self-test ────────────────────────────────────────────────────────────────
+async def test_self_test_proves_the_whole_pipeline():
+    from cta.runtime import self_test_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="555")
+    report = await self_test_async(env, _TGAny())
+    checks = report["checks"]
+
+    assert checks["state"]["ok"] is True
+    assert checks["state"]["backend"] == "MemoryStore"
+    assert checks["token"]["ok"] is True
+    assert checks["token"]["bot_username"] == "copytrader99_bot"
+    assert checks["webhook"]["ok"] is False  # nothing registered yet
+    assert checks["send"]["ok"] is True
+    assert checks["clock"]["ok"] is True
+
+
+async def test_self_test_reports_a_broken_state_backend():
+    """The exact failure that made the dashboard show invented zeros."""
+    from cta.runtime import self_test_async
+    from cta.state import UnavailableStore
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    env.STATE = UnavailableStore("namespace-without-storage")
+    report = await self_test_async(env, _TGAny())
+    assert report["checks"]["state"]["ok"] is False
+    assert report["ok"] is False
+    assert "unavailable" in report["checks"]["state"]["detail"]
+
+
+async def test_self_test_sends_a_real_message_when_an_owner_exists():
+    from cta.runtime import self_test_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="555")
+    tg = _TGAny()
+    report = await self_test_async(env, tg)
+    assert report["checks"]["send"]["chat_id"] == "555"
+    assert any("فحص ذاتي" in m.get("text", "") for m in tg.sent)
+
+
+async def test_self_test_says_what_to_do_when_there_is_no_owner_yet():
+    from cta.runtime import self_test_async
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    report = await self_test_async(env, _TGAny())
+    assert report["checks"]["send"]["ok"] is False
+    assert "/start" in report["checks"]["send"]["detail"]
+
+
+async def test_selftest_page_is_readable_and_lists_every_check():
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="555")
+    raw = await handle(FakeRequest("https://w.dev/selftest"), env, fetch=_TGAny())
+    html, headers = raw
+    assert headers["status"] in (200, 503)
+    for label in ("الذاكرة", "الاتصال", "توكن", "ربط تلغرام", "إرسال", "الذكاء", "الوقت"):
+        assert label in html
+    assert "@copytrader99_bot" in html
+
+
+async def test_selftest_json_is_machine_readable():
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    body = _body(await handle(FakeRequest("https://w.dev/selftest.json"), env, fetch=_TGAny()))
+    assert set(body["checks"]) >= {"state", "token", "webhook", "send", "ai", "clock"}
