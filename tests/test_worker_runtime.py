@@ -1576,8 +1576,6 @@ async def test_an_unreadable_body_returns_4xx_so_telegram_retries():
 
 
 async def test_a_handler_crash_returns_500_so_telegram_retries():
-    from cta.worker import handle
-
     class Exploding:
         url = "https://w.dev/telegram"
         method = "POST"

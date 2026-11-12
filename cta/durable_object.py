@@ -20,30 +20,48 @@ try:  # Cloudflare runtime
 except Exception:  # pragma: no cover - local test runs
 
     class DurableObject:  # type: ignore
-        """Fallback so this module imports cleanly under pytest."""
+        """Fallback so this module imports cleanly under pytest.
 
-        def __init__(self, ctx=None):
+        The signature must mirror the real base class exactly —
+        `__init__(self, ctx, env)` — or the subclass's `super().__init__(ctx,
+        env)` raises here while working on Cloudflare, which is the worst kind
+        of divergence: tests pass for the wrong reason.
+        """
+
+        def __init__(self, ctx=None, env=None):
             self.ctx = ctx
+            self.env = env
 
 
 class RadarState(DurableObject):
     """Key/value storage with bounded append lists, on top of DO SQLite."""
 
-    def __init__(self, ctx):
-        # Signature must match the Cloudflare SDK exactly: the runtime calls this
-        # with the DurableObjectState only, and wraps `env` itself. The previous
-        # `(ctx, env=None)` form raised TypeError on every invocation, and its
-        # `self.env` was never read anywhere in this class.
-        super().__init__(ctx)
+    def __init__(self, ctx, env=None):
+        # `DurableObject.__init__(self, ctx, env)` takes TWO arguments — verified
+        # against the built-in module and the official docs:
+        #
+        #     class Counter(DurableObject):
+        #         def __init__(self, ctx, env):
+        #             super().__init__(ctx, env)
+        #
+        # Calling `super().__init__(ctx)` raises
+        #     TypeError: DurableObject.__init__() missing 1 required positional
+        #     argument: 'env'
+        # which breaks instantiation, so every RPC call fails and the HTTP
+        # handler returns 500. Telegram reported exactly that:
+        #     Wrong response from the webhook: 500 Internal Server Error
+        #
+        # `env` is defaulted so the class still imports and instantiates in
+        # tests where only a context exists.
+        super().__init__(ctx, env)
         self._initialised = False
 
     async def _ensure_schema(self) -> None:
         if self._initialised:
             return
-        storage = self.ctx.storage
-        sql = getattr(storage, "sql", None)
+        sql = self._sql()
         if sql is not None:
-            await sql.exec(
+            sql.exec(
                 "CREATE TABLE IF NOT EXISTS kv ("
                 "  k TEXT PRIMARY KEY,"
                 "  v TEXT NOT NULL"
@@ -51,25 +69,59 @@ class RadarState(DurableObject):
             )
         self._initialised = True
 
+    def _sql(self):
+        """The DO SQL handle, or None on a KV-backed object."""
+        return getattr(getattr(self.ctx, "storage", None), "sql", None)
+
+    def _rows(self, cursor):
+        """Materialise a `SqlStorageCursor` into a Python list of dicts.
+
+        In Python the DO SQL API is **synchronous** — the docs show
+        `self.sql.exec(...)` with no `await`, and `exec` returns a cursor, not a
+        promise. Our code awaited both the call and `toArray()`, which raises
+            TypeError: object SqlStorageCursor can't be used in 'await' expression
+        A cursor is iterable, so collecting it is the reliable path.
+        """
+        if cursor is None:
+            return []
+        rows = getattr(cursor, "toArray", None)
+        if callable(rows):
+            try:
+                return list(rows())
+            except Exception:
+                pass
+        try:
+            return list(cursor)
+        except TypeError:
+            return []
+
+    async def _maybe(self, value):
+        """Await only when the platform actually returned a promise."""
+        if hasattr(value, "__await__"):
+            return await value
+        return value
+
     async def storage_get(self, key: str):
         await self._ensure_schema()
-        sql = getattr(self.ctx.storage, "sql", None)
-        if sql is None:  # pragma: no cover - older runtime without SQLite
-            return await self.ctx.storage.get(key)
-        cursor = await sql.exec("SELECT v FROM kv WHERE k = ?", key)
-        rows = await cursor.toArray()
+        sql = self._sql()
+        if sql is None:  # pragma: no cover - KV-backed object
+            return await self._maybe(self.ctx.storage.get(key))
+        rows = self._rows(sql.exec("SELECT v FROM kv WHERE k = ?", key))
         if not rows:
             return None
         row = rows[0]
-        return row["v"] if isinstance(row, dict) else row[0]
+        try:
+            return row["v"]
+        except (TypeError, KeyError, IndexError):
+            return row[0]
 
     async def storage_set(self, key: str, value: str) -> None:
         await self._ensure_schema()
-        sql = getattr(self.ctx.storage, "sql", None)
+        sql = self._sql()
         if sql is None:  # pragma: no cover
-            await self.ctx.storage.put(key, value)
+            await self._maybe(self.ctx.storage.put(key, value))
             return
-        await sql.exec(
+        sql.exec(
             "INSERT INTO kv (k, v) VALUES (?, ?) "
             "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
             key,
@@ -105,11 +157,11 @@ class RadarState(DurableObject):
 
     async def storage_delete(self, key: str) -> None:
         await self._ensure_schema()
-        sql = getattr(self.ctx.storage, "sql", None)
+        sql = self._sql()
         if sql is None:  # pragma: no cover
-            await self.ctx.storage.delete(key)
+            await self._maybe(self.ctx.storage.delete(key))
             return
-        await sql.exec("DELETE FROM kv WHERE k = ?", key)
+        sql.exec("DELETE FROM kv WHERE k = ?", key)
 
     async def fetch(self, request=None):  # pragma: no cover - RPC surface
         return None
