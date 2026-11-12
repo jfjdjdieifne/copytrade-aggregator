@@ -91,7 +91,18 @@ class Default(WorkerEntrypoint):
     async def scheduled(self, controller=None, env=None, ctx=None):
         # Called as scheduled(controller, env, ctx); env is bound on the instance
         # already, so never trust the positional args here.
-        return await scheduled(self.env, self.ctx)
+        #
+        # Cron failures are invisible by nature — nobody is watching a page. Log
+        # and swallow so one bad run does not look like the trigger is broken;
+        # the next run retries.
+        try:
+            return await scheduled(self.env, self.ctx)
+        except Exception as exc:
+            import traceback
+
+            print(f"[cta] cron cycle failed: {type(exc).__name__}: {exc}")
+            print("\n".join(traceback.format_exc().splitlines()[-5:]))
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
 
 # ── Durable Object ──────────────────────────────────────────────────────────
@@ -114,4 +125,11 @@ async def on_fetch(request, env, ctx=None):
 
 
 async def on_scheduled(env, ctx=None):
-    return await scheduled(env, ctx)
+    try:
+        return await scheduled(env, ctx)
+    except Exception as exc:
+        import traceback
+
+        print(f"[cta] cron cycle failed: {type(exc).__name__}: {exc}")
+        print("\n".join(traceback.format_exc().splitlines()[-5:]))
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}

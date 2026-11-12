@@ -28,6 +28,45 @@ class Store(Protocol):
     async def delete(self, key: str) -> None: ...
 
 
+class StoreError(RuntimeError):
+    """The state backend is reachable in principle but failed in practice."""
+
+
+class UnavailableStore:
+    """A state binding exists but could not be used.
+
+    Deliberately *not* a silent in-memory fallback. Returning an empty
+    MemoryStore when a configured Durable Object is broken is how the live
+    dashboard ended up reporting "0 signals, 0 traders, platforms unreachable"
+    — numbers that read as measurements but were only the absence of data.
+
+    Every method raises, so the caller either degrades explicitly or shows an
+    error. `/health` reports it; the page says state is unavailable instead of
+    printing zeros.
+    """
+
+    def __init__(self, reason: str = "binding") -> None:
+        self.reason = reason
+
+    def _fail(self, what: str):
+        raise StoreError(
+            f"state backend unavailable ({self.reason}): cannot {what}. "
+            "env.STATE must resolve to a Durable Object stub with storage_get."
+        )
+
+    async def get(self, key: str, default: Any = None) -> Any:
+        self._fail(f"read {key!r}")
+
+    async def set(self, key: str, value: Any) -> None:
+        self._fail(f"write {key!r}")
+
+    async def append(self, key: str, item: Any, cap: int = 500) -> list:
+        self._fail(f"append to {key!r}")
+
+    async def delete(self, key: str) -> None:
+        self._fail(f"delete {key!r}")
+
+
 class MemoryStore:
     """In-process store. Deterministic, instant, used by every test."""
 
@@ -66,9 +105,14 @@ class DurableStore:
         self.stub = stub
 
     async def _rpc(self, method: str, *args) -> Any:
+        """Call the Durable Object. Failures propagate — see `UnavailableStore`.
+
+        `MemoryStore`-style swallowing here is what made the live dashboard show
+        fabricated zeros: a broken binding looked exactly like an empty database.
+        """
         fn = getattr(self.stub, method, None)
         if fn is None:
-            return None
+            raise StoreError(f"durable object has no method {method!r}")
         result = fn(*args)
         if hasattr(result, "__await__"):
             result = await result
@@ -102,38 +146,83 @@ def _is_store_like(obj: Any) -> bool:
     return all(callable(getattr(obj, m, None)) for m in ("get", "set", "append"))
 
 
+# The single Durable Object instance name this deployment uses. One instance is
+# the point: it is the serialisation point for the cron, the webhook and /kick.
+DO_INSTANCE_NAME = "radar"
+
+
+def _resolve_binding(binding: Any) -> Any:
+    """Turn whatever `env.STATE` hands us into something with `storage_get`.
+
+    The runtime does not give us a stub. `_EnvWrapper` detects
+    `DurableObjectNamespace` and returns a `_DurableObjectNamespaceWrapper`,
+    whose `get` is `_FetcherWrapper(namespace.get(...))` — a *fetch* interface
+    with no RPC methods at all:
+
+        class _DurableObjectNamespaceWrapper:
+            def get(self, *args, **kwargs):
+                return _FetcherWrapper(self._binding.get(*args, **kwargs))
+
+    (workers-runtime-sdk `rpc.py`, and the identical built-in in workerd.)
+    Calling `storage_get` on that wrapper reaches the JS namespace, which has no
+    such method, so every read and write raised — and because `DurableStore`
+    swallowed the failure, the dashboard showed zeros that look like real
+    measurements. That is why the live page claimed the platforms were
+    unreachable while the site itself worked: the health probe could not be
+    stored, so `live` was computed from an empty dict.
+
+    So: if the binding can mint an id, mint one and take the stub. A stub
+    (`FetcherWrapper`) forwards method names to the object over RPC, which is
+    what `DurableStore` needs.
+    """
+    if binding is None or binding == "":
+        return None
+
+    # Already the object itself (or a stub that answers RPC directly).
+    if any("storage_get" in vars(k) for k in type(binding).__mro__):
+        return binding
+
+    id_from_name = getattr(binding, "idFromName", None)
+    if not callable(id_from_name):
+        return None
+
+    try:
+        stub = binding.get(id_from_name(DO_INSTANCE_NAME))
+    except Exception:
+        return None
+    return stub or None
+
+
 def store_from_env(env) -> Store:
     """Pick the best available store, degrading rather than failing.
 
-    Three cases must all work:
-      * a Durable Object stub  -> wrap it
-      * an injected Store      -> use as-is (tests, alternate backends)
-      * unbound / empty string -> in-memory, so the radar still runs locally
+    Order matters:
+      * an injected Store          -> use as-is (tests, alternate backends)
+      * a namespace or stub        -> resolve to a stub, wrap it
+      * unbound / empty string     -> in-memory, so the radar still runs locally
 
-    A stub of `""` would otherwise swallow every write and the service would look
-    alive while remembering nothing.
+    A store that is unreachable must be *reported*, not silently swapped for an
+    empty one — see `UnavailableStore`.
     """
     binding = getattr(env, "STATE", None)
 
-    # `hasattr` alone cannot be trusted: an RPC stub answers every attribute
-    # access through __getattr__, so `hasattr(binding, "storage_get")` is True
-    # even when no such method exists on the far side. Accept it only if the
-    # real class defines `storage_get`, or if the binding is genuinely a
-    # Durable Object stub/namespace.
-    cls = type(binding)
-    type_name = cls.__name__ if binding is not None else ""
-    defines_storage = any("storage_get" in vars(klass) for klass in cls.__mro__)
-    is_durable = type_name in ("DurableObjectStub", "DurableObjectNamespace")
-    try:
-        is_durable = is_durable or hasattr(binding, "idFromName")
-    except Exception:
-        pass
-
     if _is_store_like(binding):
         return binding
-    if binding and (defines_storage or is_durable):
-        return DurableStore(binding)
-    return MemoryStore()
+
+    stub = _resolve_binding(binding)
+    if stub is not None:
+        return DurableStore(stub)
+
+    # No usable Durable Object. Distinguish "not configured" from "configured
+    # but unreachable", because only the second one is a bug worth surfacing.
+    if binding in (None, ""):
+        return MemoryStore()
+
+    try:
+        note = type(binding).__name__
+    except Exception:
+        note = "binding"
+    return UnavailableStore(note)
 
 
 # ── higher-level helpers ─────────────────────────────────────────────────────
