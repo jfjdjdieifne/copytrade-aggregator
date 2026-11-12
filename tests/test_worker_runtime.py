@@ -361,7 +361,7 @@ async def test_telegram_setup_registers_webhook_with_secret():
     env.TELEGRAM_WEBHOOK_SECRET = "s3cret"
     fetcher = _TGFetch()
 
-    body = _body(await handle(FakeRequest("https://w.dev/telegram/setup"), env, fetch=fetcher))
+    body = _body(await handle(FakeRequest("https://w.dev/setup.json"), env, fetch=fetcher))
 
     assert body["ok"] is True
     assert "setWebhook" in fetcher.calls
@@ -371,7 +371,7 @@ async def test_telegram_setup_registers_webhook_with_secret():
 
 async def test_telegram_setup_refuses_without_token():
     env = _env()
-    result = await handle(FakeRequest("https://w.dev/telegram/setup"), env, fetch=_TGFetch())
+    result = await handle(FakeRequest("https://w.dev/setup.json"), env, fetch=_TGFetch())
     body = _body(result)
     assert body["ok"] is False
     assert "TELEGRAM_BOT_TOKEN" in body["error"]
@@ -382,7 +382,7 @@ async def test_telegram_setup_reports_a_rejected_url():
     env = _env()
     env.TELEGRAM_BOT_TOKEN = "123:abc"
     env.WORKER_URL = "https://wrong.example"
-    body = _body(await handle(FakeRequest("https://w.dev/telegram/setup"), env, fetch=_TGFetch(ok=False)))
+    body = _body(await handle(FakeRequest("https://w.dev/setup.json"), env, fetch=_TGFetch(ok=False)))
     assert body["ok"] is False
     assert body["last_error"] == "" or isinstance(body["last_error"], str)
 
@@ -500,7 +500,7 @@ async def test_setup_derives_worker_url_from_the_request():
     fetcher = _TGFetch()
 
     result = await handle(
-        FakeRequest("https://copytrade-aggregator.abc.workers.dev/telegram/setup"),
+        FakeRequest("https://copytrade-aggregator.abc.workers.dev/setup.json"),
         env,
         fetch=fetcher,
     )
@@ -515,7 +515,7 @@ async def test_setup_prefers_a_real_worker_url_var():
     env = _env()
     env.TELEGRAM_BOT_TOKEN = "123:abc"
     env.WORKER_URL = "https://radar.example.com"
-    body = _body(await handle(FakeRequest("https://x.dev/telegram/setup"), env, fetch=_TGFetch()))
+    body = _body(await handle(FakeRequest("https://x.dev/setup.json"), env, fetch=_TGFetch()))
     assert body["worker_url"] == "https://radar.example.com"
     assert body["worker_url_source"] == "WORKER_URL var"
 
@@ -524,7 +524,7 @@ async def test_short_setup_alias_works():
     """Typing /setup on a phone keyboard is easier than /telegram/setup."""
     env = _env()
     env.TELEGRAM_BOT_TOKEN = "123:abc"
-    body = _body(await handle(FakeRequest("https://w.dev/setup"), env, fetch=_TGFetch()))
+    body = _body(await handle(FakeRequest("https://w.dev/setup.json"), env, fetch=_TGFetch()))
     assert body["ok"] is True
     assert body["expected_url"] == "https://w.dev/telegram"
 
@@ -547,3 +547,41 @@ async def test_dash_shows_its_own_url_and_setup_link():
     )
     assert "https://copytrade-aggregator.abc.workers.dev" in body
     assert "/telegram/setup" in body
+
+
+# ── /setup renders a page a human can act on ────────────────────────────────
+async def test_setup_page_is_html_not_json():
+    """Regression: raw JSON on /setup left the operator not knowing what to do."""
+    env = _env()
+    env.TELEGRAM_BOT_TOKEN = "123:abc"
+    body, headers = await handle(FakeRequest("https://w.dev/setup"), env, fetch=_TGFetch())
+
+    assert "text/html" in headers["content-type"]
+    assert 'dir="rtl"' in body
+    assert "<pre>" not in body.split("<details>")[0]  # JSON must not be the first thing
+    # Each step states its own condition.
+    assert "/help" in body
+    assert "تم الربط" in body
+
+
+async def test_setup_page_explains_a_missing_token():
+    body, headers = await handle(FakeRequest("https://w.dev/setup"), _env(), fetch=_TGFetch())
+    assert "TELEGRAM_BOT_TOKEN" in body
+    assert headers["status"] == 400
+    assert "Settings" in body  # tells the user where to fix it
+
+
+async def test_setup_page_surfaces_telegram_rejection():
+    env = _env()
+    env.TELEGRAM_BOT_TOKEN = "123:abc"
+    env.WORKER_URL = "https://wrong.example"
+    body, _ = await handle(FakeRequest("https://w.dev/setup"), env, fetch=_TGFetch(ok=False))
+    assert "لم يكتمل" in body
+
+
+async def test_setup_json_route_still_available_for_scripts():
+    env = _env()
+    env.TELEGRAM_BOT_TOKEN = "123:abc"
+    body = _body(await handle(FakeRequest("https://w.dev/setup.json"), env, fetch=_TGFetch()))
+    assert body["ok"] is True
+    assert "worker_url" in body

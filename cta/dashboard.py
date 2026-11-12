@@ -313,3 +313,157 @@ footer.bottom{{margin-top:24px;font-size:10px;color:var(--dim);text-align:center
 
 </body>
 </html>"""
+
+
+_SETUP_CSS = """
+:root{--bg:#0b0f14;--card:#141a22;--line:#1f2731;--txt:#e8eef6;--dim:#8b97a6;
+ --ok:#16c784;--bad:#e03131;--warn:#f59f00}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--txt);
+ font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+ padding:16px;padding-bottom:60px}
+h1{font-size:20px;margin:0 0 14px}
+.hero{border-radius:16px;padding:16px;margin-bottom:16px;font-size:15px;line-height:1.7}
+.hero.good{background:#0f2417;border:1px solid #1e4d2b;color:#63e6a0}
+.hero.bad{background:#2a1414;border:1px solid #5c1d1d;color:#ff8787}
+.hero b{font-size:17px;display:block;margin-bottom:6px}
+ol,ul{list-style:none;padding:0;margin:0}
+.step{background:var(--card);border:1px solid var(--line);border-radius:14px;
+ padding:13px 15px;margin-bottom:10px;display:flex;gap:11px;align-items:flex-start}
+.step .mark{flex:0 0 24px;height:24px;border-radius:50%;display:grid;place-items:center;
+ font-size:13px;font-weight:700}
+.step.done .mark{background:#0f2417;color:var(--ok);border:1px solid #1e4d2b}
+.step.todo .mark{background:#2a2113;color:var(--warn);border:1px solid #5c4a1d}
+.step .body{min-width:0;flex:1}
+.step .t{font-size:14px;font-weight:600;margin-bottom:3px}
+.step .d{font-size:12px;color:var(--dim);line-height:1.6}
+.step code{display:block;background:#0f141a;border-radius:7px;padding:7px 9px;
+ margin-top:6px;font-size:11px;color:#8ad8ff;word-break:break-all;direction:ltr}
+a{color:#8ad8ff}
+.note{font-size:11px;color:var(--dim);text-align:center;margin-top:22px;line-height:1.9}
+details{margin-top:14px;font-size:11px;color:var(--dim)}
+summary{cursor:pointer}
+pre{background:#0f141a;border-radius:8px;padding:10px;overflow-x:auto;
+ direction:ltr;text-align:left;font-size:10px}
+"""
+
+
+def render_setup_page(
+    *,
+    ok: bool,
+    worker_url: str = "",
+    dashboard_url: str = "",
+    chat_id_set: bool = True,
+    registered_url: str = "",
+    expected_url: str = "",
+    telegram_said: str = "",
+    last_error: str = "",
+    missing: str = "",
+) -> str:
+    """Human-readable first-run page.
+
+    `/setup` used to return raw JSON, which reads as an error to anyone who is
+    not a developer — the operator was left staring at a wall of braces not
+    knowing whether it worked. This renders the same facts as a checklist where
+    every step shows its own state, so "what do I do now" is answered on screen.
+    """
+    if missing:
+        hero = (
+            '<div class="hero bad"><b>⚠️ ناقص إعداد</b>'
+            f"لم أجد <code>{html.escape(missing)}</code>. "
+            "أضفه في Settings ← Variables and Secrets ثم أعد النشر، "
+            "وبعدها أعد تحميل هذه الصفحة.</div>"
+        )
+    elif ok:
+        hero = (
+            '<div class="hero good"><b>✅ تم الربط بنجاح</b>'
+            "تلغرام صار يعرف عنوان الـ Worker. الخطوة الوحيدة الباقية: "
+            "افتح بوتك وأرسل <b>/help</b>.</div>"
+        )
+    else:
+        hero = (
+            '<div class="hero bad"><b>⚠️ لم يكتمل الربط</b>'
+            "تلغرام رفض التسجيل. السبب مذكور بالأسفل — غالباً التوكن غير صحيح "
+            "أو الـ Worker غير منشور.</div>"
+        )
+
+    def step(state: str, title: str, desc: str, code: str = "") -> str:
+        mark = "✓" if state == "done" else "!"
+        code_html = f"<code>{html.escape(code)}</code>" if code else ""
+        return (
+            f'<li class="step {state}"><span class="mark">{mark}</span>'
+            f'<div class="body"><div class="t">{title}</div>'
+            f'<div class="d">{desc}</div>{code_html}</div></li>'
+        )
+
+    steps = [
+        step(
+            "done",
+            "الـ Worker يعمل",
+            "هذه الصفحة نفسها دليل: الخادم استجاب لطلبك.",
+        ),
+        step(
+            "done" if chat_id_set else "todo",
+            "رقم محادثتك (TELEGRAM_CHAT_ID)",
+            "مضبوط." if chat_id_set else
+            "غير مضبوط — أضفه من Settings ← Variables and Secrets. "
+            "بدونه البوت يرد على أي شخص، ومع خطر استهلاك حصة الذكاء الاصطناعي.",
+            "" if chat_id_set else "خذه من @userinfobot في تلغرام",
+        ),
+        step(
+            "done" if ok else "todo",
+            "ربط تلغرام (webhook)",
+            "مسجَّل عند تلغرام." if ok else
+            "لم يكتمل. راجع الخطأ بالأسفل ثم أعد تحميل الصفحة.",
+            registered_url or expected_url or "",
+        ),
+        step(
+            "todo",
+            "جرّب البوت — الآن",
+            "افتح تلغرام، ابحث عن بوتك، وأرسل:",
+            "/help",
+        ),
+    ]
+
+    diag = ""
+    if last_error or telegram_said or not ok:
+        diag = (
+            "<details><summary>تفاصيل تقنية</summary><pre>"
+            f"expected : {html.escape(expected_url)}\n"
+            f"registered: {html.escape(registered_url)}\n"
+            f"telegram : {html.escape(telegram_said)}\n"
+            f"error    : {html.escape(last_error)}"
+            "</pre></details>"
+        )
+
+    dash = (
+        f'<li class="step todo"><span class="mark">→</span><div class="body">'
+        f'<div class="t">اللوحة الحيّة</div>'
+        f'<div class="d">حالة النظام والمتداولون المراقَبون:</div>'
+        f"<code>{html.escape(dashboard_url)}</code></div></li>"
+        if dashboard_url
+        else ""
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>تهيئة تلغرام — رادار الإجماع</title>
+<style>{_SETUP_CSS}</style>
+</head>
+<body>
+<h1>🔗 تهيئة تلغرام</h1>
+{hero}
+<ul>{"".join(steps)}</ul>
+<ul>{dash}</ul>
+{diag}
+<div class="note">
+  رابط الـ Worker:<br>
+  <code style="font-size:11px">{html.escape(worker_url)}</code><br>
+  HYPOTHETICAL_ — تحليل آلي، ليس نصيحة مالية.
+</div>
+</body>
+</html>"""
