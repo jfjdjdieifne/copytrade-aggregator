@@ -40,6 +40,22 @@ UTC = timezone.utc
 _AR_SIDE = {"LONG": "شراء", "SHORT": "بيع"}
 
 
+def _short_trace(exc: Exception) -> str:
+    """Type, message and the last frame — enough to identify, short enough to read."""
+    import traceback
+
+    frames = traceback.format_exc().splitlines()
+    tail = frames[-3:] if len(frames) > 3 else frames
+    return f"{type(exc).__name__}: {exc} | " + " / ".join(t.strip() for t in tail)
+
+
+def _escape(text: str) -> str:
+    """Strip Markdown control characters so a message can never fail to parse."""
+    for ch in ("*", "_", "`", "[", "]"):
+        text = text.replace(ch, "")
+    return text
+
+
 def parse_update_is_whoami(text) -> bool:
     """`/whoami` must work even when ownership is misconfigured."""
     if not text or not text.startswith("/"):
@@ -59,6 +75,30 @@ class Bot:
 
     # ── entry point ─────────────────────────────────────────────────────────
     async def handle_update(self, update: dict) -> dict:
+        """Never let an exception escape: silence is the worst possible answer."""
+        try:
+            return await self._handle(update)
+        except Exception as exc:
+            detail = _short_trace(exc)
+            chat_id = ""
+            try:
+                chat_id = str((parse_update(update) or {}).get("chat_id", ""))
+            except Exception:
+                pass
+            await self._note("crash", {"chat_id": chat_id, "error": detail[:200]})
+            if chat_id:
+                try:
+                    await self.tg.send(
+                        "⚠️ *خطأ غير متوقع*\n\n"
+                        f"`{_escape(str(exc))[:300]}`\n\n"
+                        "أرسل /trace لعرض آخر الأحداث.",
+                        chat_id,
+                    )
+                except Exception:
+                    pass
+            return {"handled": False, "error": detail[:300]}
+
+    async def _handle(self, update: dict) -> dict:
         parsed = parse_update(update)
         if parsed is None:
             return {"handled": False}
@@ -114,7 +154,25 @@ class Bot:
             return {"handled": True, "kind": "empty"}
 
         if text.startswith("/"):
-            reply, keyboard = await self._route_command(text, chat_id)
+            # A command that raises used to produce silence: the exception
+            # escaped the handler, the Worker answered 500, and Telegram showed
+            # the user nothing. That is indistinguishable from a dead bot.
+            # Explain it in the chat instead, where the operator already is.
+            try:
+                reply, keyboard = await self._route_command(text, chat_id)
+            except Exception as exc:
+                detail = _short_trace(exc)
+                await self._note("command_error", {"chat_id": chat_id,
+                                                   "text": (text or "")[:40],
+                                                   "error": detail[:200]})
+                await self.tg.send(
+                    "⚠️ *تعذّر تنفيذ هذا الأمر*\n\n"
+                    f"`{_escape(str(exc))[:300]}`\n\n"
+                    "_هذا خطأ في البرنامج وليس في استخدامك. أرسل /trace أو افتح_ /setup",
+                    chat_id,
+                )
+                return {"handled": True, "kind": "command", "delivered": True,
+                        "error": detail[:300]}
             sent = await self.tg.send(reply, chat_id, keyboard=keyboard or main_keyboard())
             await self._note("reply", {"chat_id": chat_id, "ok": bool(sent.get("ok")),
                                        "error": str(sent.get("error", ""))[:200],
@@ -197,6 +255,8 @@ class Bot:
             return await self.cmd_why(arg)
         if cmd == "health":
             return await self.cmd_health(), None
+        if cmd == "trace":
+            return await self.cmd_trace(), None
         if cmd == "details":
             return await self.cmd_details(arg), None
 
@@ -359,6 +419,36 @@ class Bot:
         lines.append("")
         lines.append("هذا مهم: النظام يصمت لأسباب، لا لأنه معطّل.")
         return "\n".join(lines), main_keyboard()
+
+    async def cmd_trace(self) -> str:
+        """Show the last few things that happened, from inside the chat.
+
+        `/setup` already renders this, but a phone without a browser open is a
+        worse place to debug from than the chat itself.
+        """
+        try:
+            trace = await self.store.get(KEY_TRACE, []) or []
+        except Exception as exc:
+            return f"⚠️ تعذّر قراءة السجل: `{_escape(str(exc))[:200]}`"
+
+        if not trace:
+            return (
+                "🧪 *السجل فاضي*\n\n"
+                "لا توجد أحداث مسجّلة. إن كنت أرسلت أوامر ولم تُسجّل، "
+                "فالرسائل لا تصل إلى الـ Worker أصلاً."
+            )
+
+        lines = ["🧪 *آخر الأحداث*", ""]
+        for item in trace[-8:]:
+            stamp = str(item.get("t", ""))[-8:]
+            event = item.get("event", "?")
+            extra = item.get("error") or item.get("text") or ""
+            if event == "update":
+                extra = f"{item.get('text', '')}"
+            elif event == "reply":
+                extra = "تم الإرسال" if item.get("ok") else f"فشل: {item.get('error', '')}"
+            lines.append(f"`{stamp}` {event} {_escape(str(extra))[:60]}")
+        return "\n".join(lines)
 
     async def cmd_health(self) -> str:
         counters = await self.store.get("counters", {}) or {}

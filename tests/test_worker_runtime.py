@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from cta.config import Config
 from cta.runtime import (
     handle_telegram_async,
@@ -1670,3 +1672,146 @@ async def test_setup_page_shows_the_trace_and_any_webhook_error():
     html, _ = await handle(FakeRequest("https://w.dev/setup"), env, fetch=WithError())
     assert "Connection refused" in html
     assert "/start" in html
+
+
+# ── every command must actually reply ───────────────────────────────────────
+async def test_telegram_normalises_a_keyword_only_fetch_by_itself():
+    """The bug that killed every command after /start and /help.
+
+    `Telegram` is constructed in six places. Wrapping the fetch at each call
+    site left one that missed it, and every send raised
+        TypeError: fetch() takes 1 positional argument but 2 were given
+    The bot looked dead while the token, webhook and inbound messages were all
+    fine. Normalising inside `Telegram` makes that impossible to forget.
+    """
+    from cta.telegram import Telegram
+
+    calls = []
+
+    async def sdk_fetch(resource, **options):  # keyword-only, verbatim
+        calls.append(resource)
+        return _Resp({"ok": True, "result": {"message_id": 1}})
+
+    tg = Telegram(sdk_fetch, "1:x", "555")
+    result = await tg.send("hello", "555")
+    assert result["ok"] is True
+    assert calls and calls[0].endswith("/sendMessage")
+
+
+class _Resp:
+    def __init__(self, payload):
+        self.status = 200
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+    async def text(self):
+        return json.dumps(self._payload)
+
+
+@pytest.mark.parametrize("command", [
+    "/start", "/help", "/latest", "/positions", "/watchlist", "/stats",
+    "/why", "/health", "/trace", "/details", "/unknown-command",
+])
+async def test_every_documented_command_sends_something_back(command):
+    """A command that stays silent is indistinguishable from a dead bot.
+
+    This exercises the whole chain with the live fetch shape, so a regression in
+    any layer shows up as "no message sent" rather than as a passing suite.
+    """
+    from cta.bot import Bot
+    from cta.state import MemoryStore
+    from cta.telegram import Telegram
+
+    sent = []
+
+    async def sdk_fetch(resource, **options):
+        if resource.endswith("/sendMessage"):
+            sent.append(json.loads(options["body"]))
+        return _Resp({"ok": True, "result": {"message_id": len(sent) + 1}})
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="8347000859")
+    bot = Bot(Telegram(sdk_fetch, "1:x", "8347000859"), MemoryStore(), env=env)
+
+    result = await bot.handle_update(_tg_update(chat_id=8347000859, text=command))
+    assert result.get("handled") is True, command
+    assert sent, f"{command} sent nothing back"
+    assert sent[0]["text"], command
+
+
+async def test_a_failing_command_explains_itself_in_the_chat():
+    """Silence used to be the only symptom of a crashing command."""
+    from cta.bot import Bot
+    from cta.state import MemoryStore
+    from cta.telegram import Telegram
+
+    sent = []
+
+    async def sdk_fetch(resource, **options):
+        if resource.endswith("/sendMessage"):
+            sent.append(json.loads(options["body"]))
+        return _Resp({"ok": True, "result": {"message_id": 1}})
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="8347000859")
+    bot = Bot(Telegram(sdk_fetch, "1:x", "8347000859"), MemoryStore(), env=env)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("store unavailable")
+
+    bot.cmd_latest = boom
+    result = await bot.handle_update(_tg_update(chat_id=8347000859, text="/latest"))
+
+    assert result.get("error")
+    assert sent
+    assert "تعذّر" in sent[0]["text"]
+    assert "store unavailable" in sent[0]["text"]
+
+
+async def test_an_unexpected_crash_still_answers_the_user():
+    from cta.bot import Bot
+    from cta.state import MemoryStore
+    from cta.telegram import Telegram
+
+    sent = []
+
+    async def sdk_fetch(resource, **options):
+        if resource.endswith("/sendMessage"):
+            sent.append(json.loads(options["body"]))
+        return _Resp({"ok": True, "result": {"message_id": 1}})
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="8347000859")
+    bot = Bot(Telegram(sdk_fetch, "1:x", "8347000859"), MemoryStore(), env=env)
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("catastrophic")
+
+    bot._is_owner = boom
+    result = await bot.handle_update(_tg_update(chat_id=8347000859, text="/help"))
+    assert result.get("error")
+    assert sent, "the user must be told, not left in silence"
+
+
+async def test_trace_command_reports_recorded_events():
+    from cta.bot import Bot
+    from cta.state import MemoryStore
+    from cta.telegram import Telegram
+
+    sent = []
+
+    async def sdk_fetch(resource, **options):
+        if resource.endswith("/sendMessage"):
+            sent.append(json.loads(options["body"]))
+        return _Resp({"ok": True, "result": {"message_id": 1}})
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", TELEGRAM_CHAT_ID="8347000859")
+    store = MemoryStore()
+    bot = Bot(Telegram(sdk_fetch, "1:x", "8347000859"), store, env=env)
+
+    await bot.handle_update(_tg_update(chat_id=8347000859, text="/help"))
+    sent.clear()
+    await bot.handle_update(_tg_update(chat_id=8347000859, text="/trace"))
+
+    assert sent
+    assert "آخر الأحداث" in sent[0]["text"]
+    assert "update" in sent[0]["text"] or "reply" in sent[0]["text"]

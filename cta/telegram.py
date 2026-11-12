@@ -37,7 +37,16 @@ def _chunks(text: str, limit: int = MAX_MESSAGE) -> list[str]:
 
 class Telegram:
     def __init__(self, fetch, token: str, default_chat_id: Optional[str] = None):
-        self.fetch = fetch
+        # Normalise here, not at every call site. `Telegram` is constructed in
+        # six places; wrapping the fetch in each of them left one that missed
+        # it, and the result was
+        #     TypeError: fetch() takes 1 positional argument but 2 were given
+        # on every single send. The bot looked dead while everything upstream —
+        # token, webhook, message inbound — was fine. One choke point cannot be
+        # forgotten.
+        from .http_bridge import as_fetcher
+
+        self.fetch = as_fetcher(fetch)
         self.token = token
         self.default_chat_id = default_chat_id
 
