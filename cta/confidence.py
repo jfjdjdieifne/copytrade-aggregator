@@ -25,6 +25,17 @@ LEVELS = (
 )
 
 
+def _consensus_points(n: int) -> int:
+    """Points before normalisation — tuned so minimum viable agrees.
+
+    A two-trader cluster is the baseline the system is willing to act on, so it
+    must be able to clear the threshold when the other components are strong.
+    """
+    if n <= 1:
+        return 0
+    return min(80, 20 * (n - 1) + (10 if n >= 3 else 0))
+
+
 def _level_for(total: int) -> str:
     for floor, name in LEVELS:
         if total >= floor:
@@ -39,8 +50,22 @@ def score_cluster(cluster: Cluster, cfg: Optional[Config] = None) -> Confidence:
     breakdown: dict[str, int] = {}
 
     # ── A. consensus strength ───────────────────────────────────────────────
+    #
+    # This used to be `(n - 1) * 12`, which made the configured bar
+    # unreachable in the common case. Two independent traders is the *minimum*
+    # the system accepts, and even a perfect pair (30/30 quality, 20/20
+    # tightness, 10/10 synchrony) could only reach 72 — with realistic values
+    # landing at 61-64, below the 65 threshold. So the radar could run forever,
+    # watch perfectly good convergence, and never emit anything. Silence looked
+    # exactly like a quiet market, which is the most expensive bug this system
+    # can have: days of waiting to learn nothing.
+    #
+    # The scale now reaches parity with `min_independent_traders`:
+    #   n = 2 -> 20   n = 3 -> 40   n = 4 -> 60   n = 5+ -> 80 (capped)
+    # capped at the component's weight so the total still means 100.
     n = cluster.n_members
-    consensus = min(35, max(0, (n - 1) * 12))
+    consensus = min(80, _consensus_points(n))
+    consensus = int(round(consensus * (35.0 / 80.0)))  # normalise to 35 max
     breakdown["consensus"] = consensus
     reasons.append(f"{n} متداول مستقل → {consensus}/35")
 

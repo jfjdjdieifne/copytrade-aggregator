@@ -22,6 +22,8 @@ KEY_COUNTERS = "counters"
 KEY_OWNER_CHAT = "owner_chat"
 KEY_PUBLIC_BASE = "public_base"
 KEY_TRACE = "trace"
+KEY_TG_OFFSET = "tg_offset"
+KEY_TG_POLL_ERRORS = "tg_poll_errors"
 
 
 class Store(Protocol):

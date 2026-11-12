@@ -57,12 +57,27 @@ def test_dashboard_escapes_untrusted_text():
     assert "&lt;script&gt;" in html
 
 
-def test_dashboard_marks_live_versus_demo():
-    live = render_dashboard([], [], {}, [], live=True)
-    demo = render_dashboard([], [], {}, [], live=False)
-    assert "بيانات حيّة" in live
-    assert "عرض تجريبي" in demo
-    assert "عرض تجريبي" not in live
+def test_dashboard_marks_live_versus_blind():
+    """The banner is about connectivity, not about results.
+
+    An empty dashboard and a blind dashboard look identical, and confusing them
+    is how a broken radar passes for a quiet market. Blind must say so loudly.
+    """
+    watching = render_dashboard(
+        [], [], {}, [],
+        live=True,
+        verdict={"state": "WATCHING", "cycles": 7, "healthy_sources": ["hyperliquid"]},
+    )
+    blind = render_dashboard(
+        [], [], {}, [],
+        live=False,
+        verdict={"state": "BLIND", "reason": "كل المنصات فشلت"},
+    )
+
+    assert "نراقب فعلاً" in watching
+    assert "لا يرى المنصات" in blind
+    assert "ليست قياساً" in blind  # the crucial sentence: these are not measurements
+    assert "لا يرى المنصات" not in watching
 
 
 def test_dashboard_is_self_contained():

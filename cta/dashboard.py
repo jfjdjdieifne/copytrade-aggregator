@@ -130,15 +130,39 @@ def render_dashboard(
     source_health: Optional[dict] = None,
     last_cycle: str = "—",
     base_url: str = "",
+    verdict: Optional[dict] = None,
 ) -> str:
-    """Return the full HTML page as a string."""
-    banner = (
-        '<div class="banner live">🟢 بيانات حيّة من المنصات</div>'
-        if live
-        else '<div class="banner demo">🟡 عرض تجريبي — هذه البيئة لا تصل لمنصات التداول'
-        "<br><small>الأرقام أدناه محسوبة بالكود الحقيقي على بيانات تجريبية، "
-        "ولتوليد إشارات حيّة انشر الـ Worker على Cloudflare أو شغّله من جهازك.</small></div>"
-    )
+    """Return the full HTML page as a string.
+
+    The banner is driven by `verdict`, which is about *connectivity*, not about
+    results. The distinction matters more than it sounds: an empty dashboard and
+    a blind dashboard look identical, and confusing them means waiting days for
+    a signal that was never going to come. Three states, three messages:
+
+        BLIND     "هذه ليست أصفاراً — نحن لا نرى"
+        WATCHING  "نرى البيانات، ولم يتحقق اتفاق بعد"
+        SIGNAL    a real signal exists
+    """
+    v = verdict or {}
+    state = v.get("state", "WATCHING" if live else "BLIND")
+
+    if state == "BLIND":
+        reason = v.get("reason") or "هذه البيئة لا تصل لمنصات التداول."
+        banner = (
+            '<div class="banner demo">🔴 <b>النظام لا يرى المنصات</b><br>'
+            f'<small>{html.escape(reason)}</small><br>'
+            '<small>الأصفار أدناه ليست قياساً — هي غياب بيانات. لا تعتبرها نتيجة.</small></div>'
+        )
+    elif state == "WATCHING":
+        n = v.get("cycles", 0)
+        srcs = "، ".join(v.get("healthy_sources") or []) or "—"
+        banner = (
+            '<div class="banner live">🟢 <b>نراقب فعلاً</b><br>'
+            f'<small>المنصات المتصلة: {html.escape(srcs)} · دورات: {n} · '
+            'لم يتحقق اتفاق بعد — وهذا هو الوضع الطبيعي.</small></div>'
+        )
+    else:
+        banner = '<div class="banner live">🟢 <b>إشارة متحققة</b></div>'
 
     # On a live deployment, show the addresses that matter instead of making the
     # user hunt through the Cloudflare dashboard for their Worker URL.
@@ -372,6 +396,8 @@ def render_setup_page(
     owner_linked: bool = False,
     ai_binding: bool = True,
     trace: list | None = None,
+    mode: str = "",
+    poll: dict | None = None,
 ) -> str:
     """Human-readable first-run page.
 
@@ -446,6 +472,14 @@ def render_setup_page(
             "/help",
         ),
     ]
+
+    if mode == "polling":
+        hero += (
+            '<div class="hero good" style="margin-top:10px"><b>📥 الوضع: سحب تلقائي</b>'
+            "البوت يسحب رسائلك بنفسه كل دقيقة بدل أن ينتظر تلغرام. "
+            "هذا يعني أن رسالة فاشلة لا تُفقد — تبقى في طابور تلغرام حتى تنجح. "
+            f"آخر سحب: <code>{html.escape(str((poll or {}).get('last_poll_at', '—')))}</code></div>"
+        )
 
     if last_error:
         hero += (
@@ -668,6 +702,97 @@ background:#141a21;border:1px solid #232c36}}
 {hero}
 {''.join(rows)}
 {dash}
+<p class="foot">HYPOTHETICAL_ — تحليل آلي، ليس نصيحة مالية.</p>
+</body>
+</html>"""
+
+
+def render_proof(report: dict, base_url: str = "") -> str:
+    """Show that a signal *would* be detected, without waiting to find out.
+
+    The alternative is what happened: deploying, waiting days, seeing nothing,
+    and never learning whether the radar was watching or blind. This page runs a
+    synthetic two-trader convergence through the real engine and prints what it
+    produced. If it shows a signal, silence means silence. If it shows nothing,
+    the problem is here and now.
+    """
+    ok = report.get("ok")
+    sample = report.get("sample") or {}
+
+    hero = (
+        '<div class="hero good"><b>✅ الكشف يعمل</b>'
+        "مرّرت متداولَين اصطناعيين عبر المحرّك الحقيقي، فأنتج إشارة. "
+        "أي سكوت بعد اليوم معناه أن السوق هادئ — وليس أن النظام معطّل.</div>"
+        if ok
+        else '<div class="hero bad"><b>⚠️ الكشف معطّل</b>'
+        "المحرّك لم ينتج إشارة من مدخلات نتيجتها معروفة. هذه مشكلة في البرنامج، "
+        "وليست سوقاً هادئاً. أرسل هذه الصفحة كما هي.</div>"
+    )
+
+    if ok and sample:
+        rows = [
+            ("العملة والاتجاه", f"{sample.get('coin')} · {sample.get('side')}"),
+            ("الدرجة", f"{sample.get('score')} / 100 — {sample.get('level')}"),
+            ("عدد المتداولين المستقلين", str(sample.get("n_independent"))),
+            ("دخول مقترح", str(sample.get("entry"))),
+            ("وقف الخسارة", str(sample.get("stop") or "—")),
+            ("الهدف", str(sample.get("target") or "—")),
+            ("مخاطرة/مكافأة", str(sample.get("rr") or "—")),
+        ]
+        body = "".join(
+            f'<div class="kv"><span>{html.escape(k)}</span>'
+            f'<b>{html.escape(v)}</b></div>'
+            for k, v in rows
+        )
+        breakdown = sample.get("breakdown") or {}
+        parts = " · ".join(f"{k}={v}" for k, v in breakdown.items())
+        detail = (
+            f'<div class="card"><b>تفصيل الدرجة</b>'
+            f'<div class="mono">{html.escape(parts)}</div></div>'
+            if parts
+            else ""
+        )
+        reasons = "".join(
+            f"<li>{html.escape(str(r))}</li>" for r in (sample.get("reasons") or [])
+        )
+        reason_html = f"<ul class='small'>{reasons}</ul>" if reasons else ""
+    else:
+        body = (
+            f'<div class="card bad"><b>السبب</b>'
+            f'<div class="mono">{html.escape(str(report.get("error") or report.get("note", "")))}</div></div>'
+        )
+        detail = ""
+        reason_html = ""
+
+    links = (
+        f'<p><a class="btn" href="{html.escape(base_url)}/selftest">فحص النظام</a> '
+        f'<a class="btn" href="{html.escape(base_url)}/dash">اللوحة</a></p>'
+        if base_url
+        else ""
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f14">
+<title>إثبات الكشف</title>
+<style>{_SETUP_CSS}
+.kv{{display:flex;justify-content:space-between;padding:9px 12px;border-bottom:1px solid #1e2731;font-size:14px}}
+.kv span{{color:#8fa3b8}} .kv b{{color:#e8eef6}}
+.mono{{font-family:ui-monospace,monospace;font-size:12px;color:#8fa3b8;direction:ltr;text-align:right;word-break:break-all;margin-top:6px}}
+.small{{font-size:12px;color:#8fa3b8;margin:6px 0 0;padding-inline-start:18px}}
+</style>
+</head>
+<body>
+<h1>🔬 إثبات أن الكشف يعمل</h1>
+{hero}
+<div class="card">{body}</div>
+{detail}
+{reason_html}
+<p class="small">مدخلات اصطناعية عبر المحرّك الحقيقي — تُحسب في الذاكرة، لا تُرسَل ولا تُخزَّن.</p>
+{links}
 <p class="foot">HYPOTHETICAL_ — تحليل آلي، ليس نصيحة مالية.</p>
 </body>
 </html>"""

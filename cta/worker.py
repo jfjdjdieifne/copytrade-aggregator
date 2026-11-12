@@ -20,6 +20,8 @@ import json
 from typing import Any
 
 from . import bootstrap  # noqa: F401  (kept for symmetry with local runner)
+from .health import self_check_async
+from .poller import poll_status_async, poll_updates_async
 from .runtime import (
     ensure_webhook_async,
     self_test_async,
@@ -31,6 +33,7 @@ from .runtime import (
 )
 from .dashboard import (
     render_dashboard,
+    render_proof,
     render_selftest,
     render_setup_page,
     render_state_error,
@@ -249,6 +252,14 @@ def _default_fetch(env):
         return _unavailable_fetch
 
 
+async def _poll_status_safe(env, fetcher) -> dict:
+    """Diagnostics are best-effort. A failure here must not fail the route."""
+    try:
+        return await poll_status_async(env, fetcher)
+    except Exception as exc:
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 async def _dashboard_html(store, base_url: str = "") -> str:
     """Render the live dashboard from whatever the last cron cycle stored.
 
@@ -263,6 +274,15 @@ async def _dashboard_html(store, base_url: str = "") -> str:
     rejections = await store.get("last_rejections", []) or []
     counters = await store.get("counters", {}) or {}
 
+    from .health import verdict
+
+    state = verdict(
+        source_health=health,
+        counters=counters,
+        last_cycle=last,
+        signals=len(signals),
+    )
+
     return render_dashboard(
         signals[-20:],
         watchlist,
@@ -272,10 +292,11 @@ async def _dashboard_html(store, base_url: str = "") -> str:
             "signals": counters.get("signals", 0),
         },
         rejections,
-        live=bool(health) and any(health.values()),
+        live=state["state"] != "BLIND",
         source_health=health,
         last_cycle=last,
         base_url=base_url,
+        verdict=state,
     )
 
 
@@ -393,6 +414,11 @@ async def _dispatch(request, env, ctx, fetcher):
             except Exception:
                 owner = ""
             try:
+                poll = await poll_status_async(env, fetcher)
+            except Exception as exc:
+                # Diagnostics must never break the page that reports diagnostics.
+                poll = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+            try:
                 await store.set(KEY_PUBLIC_BASE, base)
             except Exception:
                 pass
@@ -420,6 +446,8 @@ async def _dispatch(request, env, ctx, fetcher):
                 "chat_id_set": bool(chat_id),
                 "pending_updates": all_updates,
                 "trace": trace[-8:],
+                "mode": poll.get("mode", ""),
+                "poll": {k: v for k, v in poll.items() if k != "errors"},
                 "last_error": detail.get("last_error_message", ""),
                 "telegram_said": hook.get("description", ""),
                 "token_ok": bool(me.get("ok")),
@@ -445,10 +473,22 @@ async def _dispatch(request, env, ctx, fetcher):
                     token_error=result["token_error"],
                     pending_updates=result["pending_updates"],
                     trace=result["trace"],
+                    mode=result["mode"],
+                    poll=result["poll"],
                     owner_linked=result["owner_linked"],
                     ai_binding=result["ai_binding"],
                 ),
                 {"status": 200 if result["ok"] else 502,
+                 "content-type": "text/html; charset=utf-8"},
+            )
+
+        if path in ("/prove", "/proof", "/verify"):
+            report = await self_check_async(env, fetcher)
+            if path.endswith(".json") or "format=json" in str(getattr(request, "url", "")):
+                return _json(report)
+            return (
+                render_proof(report, _configured_base(env) or _origin(request)),
+                {"status": 200 if report.get("ok") else 503,
                  "content-type": "text/html; charset=utf-8"},
             )
 
@@ -486,6 +526,7 @@ async def _dispatch(request, env, ctx, fetcher):
                     "signals": counters.get("signals", 0),
                     "last_cycle_at": await store.get("last_cycle_at"),
                     "source_health": await store.get("source_health", {}),
+                    "telegram": await _poll_status_safe(env, fetcher),
                 }
             )
 
@@ -509,8 +550,22 @@ async def _dispatch(request, env, ctx, fetcher):
 
 
 async def scheduled(env, ctx=None, fetch=None):
-    """Cron trigger: profile daily, scan every run, track outcomes hourly."""
+    """Cron trigger: answer Telegram, profile daily, scan, track outcomes.
+
+    Ordering matters. Telegram is polled first, before the expensive cycle: a
+    slow or failing venue call must not delay replies, and news of a failure
+    should reach the operator before the work it applies to.
+    """
     fetcher = as_fetcher(fetch or _default_fetch(env))
+
+    # Answer Telegram by collecting from getUpdates. This replaces the webhook,
+    # so a broken response can no longer make the bot silent: nothing has to
+    # reach us, we go and get it. Messages survive a failed deploy in Telegram's
+    # queue instead of being dropped.
+    try:
+        await poll_updates_async(env, fetcher)
+    except Exception as exc:
+        print(f"[cta] telegram poll failed: {type(exc).__name__}: {exc}")
 
     # Keep the Telegram webhook registered. Self-healing: if it was never set
     # (nobody opened /setup) or an old URL is still registered, this fixes it
