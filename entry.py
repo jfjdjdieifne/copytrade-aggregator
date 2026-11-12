@@ -16,7 +16,18 @@ takes `env` explicitly, so all the routing logic stays ordinary testable Python.
 
 from __future__ import annotations
 
-from cta.worker import handle, scheduled
+import os
+import sys
+
+# Workers Builds runs `pip install .` before `wrangler deploy`, which leaves a
+# second copy of the package at build/lib/cta. Only the entrypoint's own
+# directory is on sys.path, so `import cta` must resolve to the copy that sits
+# next to this file. Say so explicitly rather than relying on import order.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if os.path.isdir(os.path.join(_HERE, "cta")) and _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from cta.worker import handle, scheduled  # noqa: E402
 
 try:  # Cloudflare runtime only
     from workers import WorkerEntrypoint  # type: ignore
