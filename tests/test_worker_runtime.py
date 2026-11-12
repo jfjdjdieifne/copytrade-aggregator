@@ -279,3 +279,43 @@ async def test_dash_shows_why_clusters_were_rejected():
     body, _ = await handle(FakeRequest("https://x.dev/dash"), env, fetch=FakeFetch({}))
     assert "SOL" in body
     assert "انتشار واسع" in body
+
+
+# ── entrypoint ──────────────────────────────────────────────────────────────
+# entry.py is the only file Cloudflare actually invokes. It must expose the
+# class-based handler (current runtime) and still delegate to cta.worker.
+async def test_entry_default_class_delegates_fetch():
+    import entry
+
+    env = _env()
+    called = {}
+
+    class Recorder:
+        async def fetch(self, request, env=None, ctx=None):
+            called["ok"] = True
+            return await handle(request, env or self.env, ctx)
+
+    assert hasattr(entry, "Default")
+    rec = Recorder()
+    rec.env = env
+    await rec.fetch(FakeRequest("https://x.dev/health"), env)
+    assert called["ok"] is True
+
+
+async def test_entry_scheduled_is_exposed():
+    """The cron trigger resolves `scheduled`; a missing one silently stops scans."""
+    import entry
+
+    assert hasattr(entry, "Default")
+    assert hasattr(entry.Default, "scheduled")
+    assert callable(entry.on_scheduled)
+
+
+async def test_entry_class_fetch_uses_self_env_when_not_passed():
+    """Cloudflare calls `fetch(request)` only; env comes from the instance."""
+    import entry
+
+    env = _env()
+    worker = entry.Default(None, env)
+    body = _body(await worker.fetch(FakeRequest("https://x.dev/health")))
+    assert body["ok"] is True

@@ -78,12 +78,22 @@ async def _body_json(request) -> dict:
         return {}
 
 
+async def _unavailable_fetch(*_args, **_kwargs):
+    """Placeholder used when no fetch implementation can be resolved.
+
+    Raising here (instead of at resolve time) is deliberate. Routes such as
+    `/health` and `/dash` read only from the Durable Object and need no network
+    at all; a failure to find `js.fetch` must not take those down with it. Only
+    a venue call — which genuinely needs the network — should fail.
+    """
+    raise RuntimeError("no fetch implementation available: pass fetch=... or run on Cloudflare")
+
+
 def _default_fetch(env):
     """Resolve a fetch implementation, preferring one injected for tests.
 
-    `js` only exists inside the Cloudflare runtime, so it is imported lazily: a
-    missing binding must degrade to a clear error, never to an import crash that
-    takes the whole Worker down before a single route runs.
+    `js` only exists inside the Cloudflare runtime, so it is imported lazily and
+    never allowed to raise at import time.
     """
     try:
         injected = getattr(env, "fetch", None)
@@ -96,9 +106,7 @@ def _default_fetch(env):
 
         return js.fetch
     except Exception:  # pragma: no cover - only hit outside Cloudflare
-        raise RuntimeError(
-            "no fetch implementation available: pass fetch=... or run on Cloudflare"
-        )
+        return _unavailable_fetch
 
 
 async def _dashboard_html(store) -> str:

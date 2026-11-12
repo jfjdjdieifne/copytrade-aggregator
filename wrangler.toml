@@ -17,10 +17,13 @@
 name = "copytrade-radar"
 main = "entry.py"
 compatibility_date = "2026-09-01"
-
-# Python Workers (GA). Keep the flag so older accounts still build.
-[python]
-experimental_cron = true
+# Required. Without it wrangler refuses to build at all:
+#   "The `python_workers` compatibility flag is required to use Python."
+compatibility_flags = ["python_workers"]
+# NOTE: there is deliberately no `[python]` table. Wrangler 4.x does not know the
+# key (it warns "Unexpected fields found in top-level field: python") and the
+# scheduler is registered through `[triggers].crons` below. The old
+# `[python] experimental_cron` flag predates Python Workers going GA.
 
 # ── non-secret configuration ────────────────────────────────────────────────
 [vars]
@@ -86,7 +89,6 @@ crons = ["* * * * *"]
 # ── local development ───────────────────────────────────────────────────────
 [dev]
 port = 8787
-local_protocol = "http"
 
 [observability]
 enabled = true
