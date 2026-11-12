@@ -1,0 +1,93 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy-Trade Aggregator v2 — Cloudflare Python Worker
+#
+# Deploy:
+#   npm i -g wrangler          (or use npx)
+#   wrangler login
+#   wrangler secret put TELEGRAM_BOT_TOKEN
+#   wrangler secret put TELEGRAM_CHAT_ID
+#   wrangler secret put TELEGRAM_WEBHOOK_SECRET
+#   wrangler secret put OWNER_TOKEN
+#   wrangler deploy
+#
+# Free plan covers this workload: 100k requests/day, 10k Workers AI neurons/day,
+# and a cron trigger every minute is a single request.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name = "copytrade-radar"
+main = "entry.py"
+compatibility_date = "2026-09-01"
+
+# Python Workers (GA). Keep the flag so older accounts still build.
+[python]
+experimental_cron = true
+
+# ── non-secret configuration ────────────────────────────────────────────────
+[vars]
+WORKER_URL = "https://copytrade-radar.<your-subdomain>.workers.dev"
+
+# venues
+HL_BASE_URL = "https://api.hyperliquid.xyz"
+HL_STATS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+DYDX_BASE_URL = "https://indexer.dydx.trade/v4"
+GMX_BASE_URL = "https://arbitrum.gmxapi.io/v1"
+ENABLED_SOURCES = "hyperliquid,dydx,gmx"
+
+# seed wallets for venues with no follower leaderboard (dYdX / GMX)
+# comma-separated addresses, e.g. "dydx1abc...,dydx1def..."
+DYDX_SEED_WALLETS = ""
+GMX_SEED_WALLETS = ""
+
+# discovery + watchlist
+WATCHLIST_MAX = "150"
+DISCOVERY_MAX_CANDIDATES = "300"
+WATCHLIST_MIN_GRADE = "PROVEN"
+
+# convergence gates
+MIN_INDEPENDENT_TRADERS = "2"
+MIN_ELITE_OR_PROVEN = "2"
+CONVERGENCE_WINDOW_MIN = "90"
+ENTRY_TOLERANCE_BPS = "50"
+MAX_SLIPPAGE_BPS = "50"
+MAX_MEDIAN_LEVERAGE = "10"
+
+# emission
+MIN_SIGNAL_SCORE = "65"
+RISK_PER_TRADE_PCT = "1.0"
+
+# ai
+AI_ENABLED = "true"
+AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+AI_DAILY_NEURON_SOFT_CAP = "8000"
+
+# ops
+DRY_RUN = "false"
+LOG_LEVEL = "INFO"
+
+# ── AI: Workers AI, no key, 10k free neurons/day ────────────────────────────
+[ai]
+binding = "AI"
+
+# ── state: a Durable Object gives us one serialisation point + SQLite ───────
+[[durable_objects.bindings]]
+name = "STATE"
+class_name = "RadarState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RadarState"]
+
+# ── scheduled work ──────────────────────────────────────────────────────────
+# Every minute: scan. The worker itself decides when to re-profile (daily) and
+# when to track outcomes, so one cron entry covers all three jobs.
+[triggers]
+crons = ["* * * * *"]
+
+# ── local development ───────────────────────────────────────────────────────
+[dev]
+port = 8787
+local_protocol = "http"
+
+[observability]
+enabled = true
+head_sampling_rate = 1.0

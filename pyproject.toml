@@ -1,3 +1,29 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "copytrade-aggregator"
+version = "2.0.0"
+description = "Consensus radar for proven traders across free crypto venues (Hyperliquid, dYdX, GMX) — Cloudflare Python Worker"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.setuptools]
+py-modules = ["entry"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["cta*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]

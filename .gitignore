@@ -1,76 +1,42 @@
-# copytrade-aggregator — ملفات تُتجاهل في Git
-
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-parts/
-lib/
-lib64/
-sdist/
-var/
-wheels/
-share/
-python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# بيئات افتراضية
-.venv/
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# إعدادات IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# ملفات نظام macOS
-.DS_Store
-.AppleDouble
-.LSOverride
-
-# مجلدات اختبارات وتغطية
-.tox/
-.nox/
+.eggs/
+.pytest_cache/
 .coverage
-.coverage.*
-.cache
-nosetests.xml
 coverage.xml
-*.cover
-.hypothesis/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
 
-# ملفات إخراج التشغيل (مؤقتة)
-/tmp/*
-/output/*
-/results/*
+# Virtual environments
+.venv/
+venv/
+env/
 
-# ملفات بيانات حقيقية (لا تُرتفع إلى Git)
-*.csv
-*.csv.gz
-*.json
-*.log
-
-# ملفات.env (تحتوي على مفاتيح API حساسة)
+# Secrets — never commit
 .env
 .env.local
 .env.*.local
+.dev.vars
 
-# ملاحظات المطور
-*.md.bak
+# Cloudflare
+.wrangler/
+node_modules/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Generated data
+/output/
+/results/
+*.log
+*.sqlite
+*.db
