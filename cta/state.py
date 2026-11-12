@@ -115,9 +115,23 @@ def store_from_env(env) -> Store:
     """
     binding = getattr(env, "STATE", None)
 
+    # `hasattr` alone cannot be trusted: an RPC stub answers every attribute
+    # access through __getattr__, so `hasattr(binding, "storage_get")` is True
+    # even when no such method exists on the far side. Accept it only if the
+    # real class defines `storage_get`, or if the binding is genuinely a
+    # Durable Object stub/namespace.
+    cls = type(binding)
+    type_name = cls.__name__ if binding is not None else ""
+    defines_storage = any("storage_get" in vars(klass) for klass in cls.__mro__)
+    is_durable = type_name in ("DurableObjectStub", "DurableObjectNamespace")
+    try:
+        is_durable = is_durable or hasattr(binding, "idFromName")
+    except Exception:
+        pass
+
     if _is_store_like(binding):
         return binding
-    if binding and hasattr(binding, "storage_get"):
+    if binding and (defines_storage or is_durable):
         return DurableStore(binding)
     return MemoryStore()
 

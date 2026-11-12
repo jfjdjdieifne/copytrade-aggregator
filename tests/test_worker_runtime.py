@@ -585,3 +585,70 @@ async def test_setup_json_route_still_available_for_scripts():
     body = _body(await handle(FakeRequest("https://w.dev/setup.json"), env, fetch=_TGFetch()))
     assert body["ok"] is True
     assert "worker_url" in body
+
+
+# ── entrypoint binding + crash safety (Error 1101) ──────────────────────────
+def test_entrypoint_declares_init_so_the_sdk_can_bind_env():
+    """Reproduces the live Error 1101.
+
+    The SDK's `_wrap_class` patches the constructor to
+    `wrapped_init(self, *args)` and passes the bindings as args[1]:
+        if len(args) > 1: args[1] = _EnvWrapper(args[1])
+    A subclass with no __init__ never accepts that second argument, so
+    construction raises TypeError and Cloudflare reports Error 1101 with no
+    detail. Declaring __init__(self, ctx, env) is what fixes it.
+    """
+    import inspect
+
+    import entry
+
+    params = list(inspect.signature(entry.Default.__init__).parameters)
+    assert params == ["self", "ctx", "env"]
+
+
+def test_entrypoint_binds_env_from_the_second_argument():
+    import entry
+
+    class Ctx:
+        pass
+
+    class Env:
+        STATE = None
+        WORKER_URL = "https://x.dev"
+
+    inst = entry.Default(Ctx(), Env())
+    assert inst.env is not None
+    assert inst.ctx is not None
+
+
+async def test_handle_never_raises_even_when_the_store_explodes():
+    """A crash must become a JSON error, not a 1101 blank page."""
+
+    class Exploding:
+        async def get(self, *_a, **_k):
+            raise RuntimeError("durable object is unhappy")
+
+        async def set(self, *_a, **_k):
+            raise RuntimeError("durable object is unhappy")
+
+        async def append(self, *_a, **_k):
+            raise RuntimeError("durable object is unhappy")
+
+    env = _env()
+    env.STATE = Exploding()
+    result = await handle(FakeRequest("https://w.dev/health"), env, fetch=FakeFetch({}))
+    body = _body(result)
+    assert body["ok"] is False
+    assert "unhappy" in body["error"]
+    assert result[1]["status"] == 500
+
+
+def test_store_falls_back_when_binding_is_an_opaque_object():
+    """A stub-shaped object that cannot serve RPC must not take the Worker down."""
+    from cta.state import MemoryStore, store_from_env
+
+    class Opaque:
+        """Answers every attribute, like a JS proxy, but defines no methods."""
+
+    store = store_from_env(FakeEnv(STATE=Opaque()))
+    assert isinstance(store, MemoryStore)
