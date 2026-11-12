@@ -21,15 +21,23 @@ from typing import Any
 
 from . import bootstrap  # noqa: F401  (kept for symmetry with local runner)
 from .runtime import (
+    ensure_webhook_async,
+    self_test_async,
     boot_async,
     handle_telegram_async,
     run_cycle_async,
     run_profile_async,
     track_outcomes_async,
 )
-from .dashboard import render_dashboard, render_setup_page, render_state_error
+from .dashboard import (
+    render_dashboard,
+    render_selftest,
+    render_setup_page,
+    render_state_error,
+)
+from .http_bridge import as_fetcher
 from .telegram import Telegram
-from .state import get_signals, get_watchlist, store_from_env
+from .state import KEY_OWNER_CHAT, KEY_PUBLIC_BASE, get_signals, get_watchlist, store_from_env
 
 JSON_HEADERS = {
     "content-type": "application/json; charset=utf-8",
@@ -89,6 +97,21 @@ def _configured_base(env) -> str:
     return raw
 
 
+def _origin_from_env(env) -> str:
+    """Self-discover the public URL when there is no request (the cron path).
+
+    The origin normally comes from the incoming request, but a cron trigger has
+    none. The bindings expose it: the runtime injects `CF_*`/`WORKER_URL`-style
+    values depending on version, so try each in turn. Failing all of them, the
+    cron simply skips webhook registration — `/setup` still works by hand.
+    """
+    for name in ("WORKER_URL", "CF_WORKER_URL", "WORKER_PUBLIC_URL"):
+        value = str(getattr(env, name, "") or "").strip().rstrip("/")
+        if value and "<" not in value and ">" not in value and "://" in value:
+            return value
+    return ""
+
+
 def _method(request) -> str:
     return (getattr(request, "method", "GET") or "GET").upper()
 
@@ -131,17 +154,17 @@ def _default_fetch(env):
         injected = None
     if callable(injected):
         return injected
-    # Prefer the SDK's own fetch. It converts the options dict to a real JS
+    # Prefer the SDK's own fetch: it converts the options dict to a real JS
     # object and wraps the reply in `Response`:
     #
-    #     resp = await _pyfetch_patched(resource, **other_options)
-    #     return Response(resp.js_response)
+    #     async def fetch(resource, **other_options):
+    #         resp = await _pyfetch_patched(resource, **other_options)
+    #         return Response(resp.js_response)
     #
-    # Calling `js.fetch(url, python_dict)` directly does NOT work: a Python dict
-    # reaches JavaScript as a proxy, `new Request(url, init)` reads `init.method`
-    # as undefined, and the request silently becomes a bodyless GET. Telegram's
-    # sendMessage then fails while getMe appears to succeed — a confusing split
-    # that looks like a broken bot rather than a broken call.
+    # Note the keyword-only signature. Our callers all use `(url, init_dict)`,
+    # so the adapter below normalises the shape; returning a bare `js.fetch`
+    # here is not enough, because it needs a converted object rather than a
+    # Python dict. See `cta.http_bridge.as_fetcher`.
     try:
         from workers import fetch as sdk_fetch  # noqa: PLC0415 — runtime only
 
@@ -203,7 +226,7 @@ async def handle(request, env, ctx=None, fetch=None):
     live deployment produced when the entrypoint could not see its bindings.
     """
     try:
-        fetcher = fetch or _default_fetch(env)
+        fetcher = as_fetcher(fetch or _default_fetch(env))
         return await _dispatch(request, env, ctx, fetcher)
     except Exception as exc:  # never leak a stack trace to the web
         return _json({"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}, 500)
@@ -254,6 +277,15 @@ async def _dispatch(request, env, ctx, fetcher):
                     {"status": 400, "content-type": "text/html; charset=utf-8"},
                 )
 
+            # Remember the URL the browser used. The cron has no request, so
+            # this is how webhook registration survives without anyone having
+            # to set WORKER_URL by hand. Self-healing, and it cannot go stale
+            # because /setup re-records it on every visit.
+            try:
+                await store_from_env(env).set(KEY_PUBLIC_BASE, base)
+            except Exception:
+                pass
+
             tg = Telegram(fetcher, token)
             # Which bot is this token actually for? Without asking, a token from
             # a different bot silently registers a webhook nobody is watching,
@@ -264,8 +296,22 @@ async def _dispatch(request, env, ctx, fetcher):
             info = await tg.get_webhook_info()
             detail = info.get("result", {}) if info.get("ok") else {}
 
+            store = store_from_env(env)
+            try:
+                owner = str(await store.get(KEY_OWNER_CHAT, "") or "")
+            except Exception:
+                owner = ""
+            try:
+                await store.set(KEY_PUBLIC_BASE, base)
+            except Exception:
+                pass
+
             result = {
                 "ok": bool(hook.get("ok")),
+                "owner_linked": bool(owner or chat_id),
+                "owner_chat_id": owner or chat_id,
+                "ai_enabled": str(getattr(env, "AI_ENABLED", "true")).lower() != "false",
+                "ai_binding": bool(getattr(env, "AI", None) is not None),
                 "registered_url": detail.get("url", ""),
                 "expected_url": f"{base}/telegram",
                 "worker_url": base,
@@ -298,8 +344,21 @@ async def _dispatch(request, env, ctx, fetcher):
                     token_ok=result["token_ok"],
                     token_error=result["token_error"],
                     pending_updates=result["pending_updates"],
+                    owner_linked=result["owner_linked"],
+                    ai_binding=result["ai_binding"],
                 ),
                 {"status": 200 if result["ok"] else 502,
+                 "content-type": "text/html; charset=utf-8"},
+            )
+
+        if path in ("/selftest", "/self-test", "/diagnose",
+                    "/selftest.json", "/self-test.json", "/diagnose.json"):
+            report = await self_test_async(env, fetcher)
+            if path.endswith(".json") or "format=json" in str(getattr(request, "url", "")):
+                return _json(report)
+            return (
+                render_selftest(report, _configured_base(env) or _origin(request)),
+                {"status": 200 if report.get("ok") else 503,
                  "content-type": "text/html; charset=utf-8"},
             )
 
@@ -350,7 +409,23 @@ async def _dispatch(request, env, ctx, fetcher):
 
 async def scheduled(env, ctx=None, fetch=None):
     """Cron trigger: profile daily, scan every run, track outcomes hourly."""
-    fetcher = fetch or _default_fetch(env)
+    fetcher = as_fetcher(fetch or _default_fetch(env))
+
+    # Keep the Telegram webhook registered. Self-healing: if it was never set
+    # (nobody opened /setup) or an old URL is still registered, this fixes it
+    # within a minute of the token existing. A wrong URL here is exactly the
+    # "the bot does not answer" failure with no visible cause.
+    try:
+        base = _configured_base(env) or _origin_from_env(env)
+        if not base:
+            try:
+                base = str(await store_from_env(env).get(KEY_PUBLIC_BASE, "") or "")
+            except Exception:
+                base = ""
+        if base:
+            await ensure_webhook_async(env, fetcher, base)
+    except Exception as exc:
+        print(f"[cta] webhook check failed: {type(exc).__name__}: {exc}")
 
     result = await run_cycle_async(env, fetcher)
     try:

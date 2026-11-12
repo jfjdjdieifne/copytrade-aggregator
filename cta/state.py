@@ -19,6 +19,8 @@ KEY_SIGNALS = "signals"
 KEY_MEMORY = "memory"
 KEY_STATS = "stats"
 KEY_COUNTERS = "counters"
+KEY_OWNER_CHAT = "owner_chat"
+KEY_PUBLIC_BASE = "public_base"
 
 
 class Store(Protocol):

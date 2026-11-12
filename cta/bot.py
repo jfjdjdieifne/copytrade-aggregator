@@ -24,6 +24,7 @@ from .ai import (  # noqa: F401
 )
 from .config import Config
 from .state import (
+    KEY_OWNER_CHAT,
     KEY_STATS,
     KEY_WATCHLIST,
     Store,
@@ -36,6 +37,13 @@ from .telegram import HELP_TEXT, Telegram, main_keyboard, parse_update, signal_k
 UTC = timezone.utc
 
 _AR_SIDE = {"LONG": "شراء", "SHORT": "بيع"}
+
+
+def parse_update_is_whoami(text) -> bool:
+    """`/whoami` must work even when ownership is misconfigured."""
+    if not text or not text.startswith("/"):
+        return False
+    return text.split()[0].lower().lstrip("/").split("@")[0] == "whoami"
 
 
 class Bot:
@@ -60,11 +68,32 @@ class Bot:
         # Anyone who finds the bot can talk to it and burn the shared Workers AI
         # allowance (10k neurons/day on the free plan). When the owner's chat is
         # known, everyone else gets a polite refusal instead of a conversation.
-        if not self._chat_allowed(chat_id):
+        if parse_update_is_whoami(text):
+            info = await self.tg.call("getMe", {})
+            me = info.get("result", {}) if info.get("ok") else {}
+            await self.tg.send(
+                "🪪 معلومات الربط\n"
+                f"رقم محادثتك: `{chat_id}`\n"
+                f"البوت: @{me.get('username', '?')}\n"
+                "ضع رقم المحادثة في TELEGRAM_CHAT_ID إن أردت تثبيت المالك.",
+                chat_id,
+            )
+            return {"handled": True, "kind": "whoami", "chat_id": chat_id}
+
+        allowed, claimed = await self._is_owner(chat_id)
+        if not allowed:
             await self.tg.send(
                 "هذا البوت خاص. غير مصرّح لهذه المحادثة.", chat_id
             )
             return {"handled": False, "reason": "chat not allowed", "chat_id": chat_id}
+        if claimed:
+            await self.tg.send(
+                "✅ تم ربط هذه المحادثة بصاحب البوت.\n"
+                f"رقم محادثتك: `{chat_id}`\n"
+                "من الآن أنت الوحيد الذي يستطيع استخدامه.\n"
+                "أرسل /help لعرض الأوامر.",
+                chat_id,
+            )
 
         if parsed["kind"] == "callback":
             await self.tg.answer_callback(parsed["callback_id"])
@@ -89,16 +118,34 @@ class Bot:
         await self.tg.send(reply, chat_id, keyboard=main_keyboard())
         return {"handled": True, "kind": "chat"}
 
-    def _chat_allowed(self, chat_id: str) -> bool:
-        """Only the configured owner chat may use the bot.
+    async def _is_owner(self, chat_id: str) -> tuple[bool, bool]:
+        """Decide whether this chat may use the bot. Returns (allowed, claimed).
 
-        Empty `TELEGRAM_CHAT_ID` means "not configured yet" and is allowed, so a
-        first setup is never locked out; once it is set, it is enforced.
+        `TELEGRAM_CHAT_ID` used to be a required manual step, and getting it
+        wrong is a trap: set it to the *bot's own* id (a very natural mistake,
+        since BotFather prints that id) and the bot silently refuses its real
+        owner with no way out.
+
+        So ownership is now learned instead of configured:
+          * an explicit `TELEGRAM_CHAT_ID` still wins when it is set;
+          * otherwise the first chat to message the bot claims ownership, and
+            the claim is persisted in Durable Object state, so it survives
+            redeploys and cron runs;
+          * `/whoami` always answers, so a mistyped variable is diagnosable.
+
+        The claim is deliberately sticky: one bot, one owner.
         """
-        owner = str(getattr(self.env, "TELEGRAM_CHAT_ID", "") or "").strip()
-        if not owner:
-            return True
-        return str(chat_id) == owner
+        env_owner = str(getattr(self.env, "TELEGRAM_CHAT_ID", "") or "").strip()
+        stored = str(await self.store.get(KEY_OWNER_CHAT, "") or "").strip()
+
+        if env_owner:
+            return str(chat_id) == env_owner, False
+        if stored:
+            return str(chat_id) == stored, False
+
+        # Nothing configured and nobody has claimed it yet: take this chat.
+        await self.store.set(KEY_OWNER_CHAT, str(chat_id))
+        return True, True
 
     # ── commands ────────────────────────────────────────────────────────────
     async def _route_command(self, text: str, chat_id: str) -> tuple[str, Optional[list]]:

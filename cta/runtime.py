@@ -15,9 +15,11 @@ from .ai import narrate_signal
 from .bot import Bot
 from .config import Config
 from .engine import run_cycle
+from .http_bridge import as_fetcher
 from .outcomes import evaluate, summarize
 from .sources import build_venues
 from .state import (
+    KEY_OWNER_CHAT,
     KEY_STATS,
     append_outcome,
     get_signals,
@@ -36,6 +38,7 @@ def _now() -> datetime:
 
 async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     """One full radar cycle. Returns a JSON-serialisable report."""
+    fetch = as_fetcher(fetch)
     cfg = cfg or Config.from_env(env)
     store = store_from_env(env)
     venues = build_venues(fetch, cfg)
@@ -110,11 +113,159 @@ async def run_profile_async(env, fetch, cfg: Optional[Config] = None) -> dict:
 
 async def handle_telegram_async(env, fetch, update: dict) -> dict:
     """Route one Telegram update."""
+    fetch = as_fetcher(fetch)
     cfg = Config.from_env(env)
     store = store_from_env(env)
     tg = Telegram(fetch, getattr(env, "TELEGRAM_BOT_TOKEN", ""), getattr(env, "TELEGRAM_CHAT_ID", ""))
     bot = Bot(tg, store, env=env, cfg=cfg)
     return await bot.handle_update(update)
+
+
+async def ensure_webhook_async(env, fetch, base: str = "") -> dict:
+    """Register the Telegram webhook without anyone clicking /setup.
+
+    Setup used to require a visit to `/setup`, which is easy to skip and leaves
+    the bot silently dead: Telegram has no webhook, so `/start` goes nowhere and
+    the operator has no signal at all. The cron now does it, so a deployment
+    that has a token becomes live on its own within a minute.
+
+    It is deliberately cheap and idempotent: `getWebhookInfo` first, and only
+    `setWebhook` when it disagrees. That keeps the free-tier request budget
+    intact and avoids re-registering on every run.
+    """
+    fetch = as_fetcher(fetch)
+    token = str(getattr(env, "TELEGRAM_BOT_TOKEN", "") or "")
+    if not token or not base:
+        return {"ok": False, "reason": "no token or base url"}
+
+    tg = Telegram(fetch, token)
+    info = await tg.get_webhook_info()
+    detail = info.get("result", {}) if info.get("ok") else {}
+    current = str(detail.get("url", "") or "")
+    expected = f"{base.rstrip('/')}/telegram"
+    if current == expected:
+        return {"ok": True, "changed": False, "url": current}
+
+    result = await tg.set_webhook(expected)
+    return {
+        "ok": bool(result.get("ok")),
+        "changed": True,
+        "url": expected,
+        "telegram_said": result.get("description", ""),
+    }
+
+
+async def self_test_async(env, fetch) -> dict:
+    """Ask the platform seven questions and report the answers.
+
+    This exists because "nothing arrived on Telegram" has many indistinguishable
+    causes, and waiting for a message cannot tell them apart. Each check below
+    is one of the failure modes actually seen in this project:
+
+      1. state      — the Durable Object was handed over as a namespace, so
+                      every read/write raised and the dashboard showed zeros
+      2. fetch      — the SDK's fetch is keyword-only: our (url, dict) call
+                      raised TypeError and was reported as a bad token
+      3. token      — getMe proves the token and names the bot
+      4. webhook    — Telegram's own view of the registered URL
+      5. send       — an actual sendMessage to the owner chat
+      6. ai         — whether Workers AI is bound (narration vs deterministic)
+      7. clock      — UTC time, so logs can be matched to this page
+
+    Nothing here is inferred; every field is a result the platform returned.
+    """
+    fetch = as_fetcher(fetch)
+    out: dict = {"ok": True, "checks": {}}
+
+    # 1. state
+    store = store_from_env(env)
+    probe = f"selftest:{datetime.now(UTC).timestamp()}"
+    try:
+        await store.set(probe, {"t": 1})
+        round_trip = await store.get(probe, None)
+        await store.delete(probe)
+        out["checks"]["state"] = {
+            "ok": round_trip == {"t": 1},
+            "backend": type(store).__name__,
+            "detail": "" if round_trip == {"t": 1} else "write succeeded but read returned nothing",
+        }
+    except Exception as exc:
+        out["checks"]["state"] = {
+            "ok": False,
+            "backend": type(store).__name__,
+            "detail": f"{type(exc).__name__}: {exc}"[:200],
+        }
+
+    # 2. fetch reachability (Telegram's getMe is the cheapest real call)
+    token = str(getattr(env, "TELEGRAM_BOT_TOKEN", "") or "")
+    tg = Telegram(fetch, token)
+    if not token:
+        out["checks"]["fetch"] = {"ok": False, "detail": "no TELEGRAM_BOT_TOKEN to call"}
+        out["checks"]["token"] = {"ok": False, "detail": "missing"}
+        out["checks"]["webhook"] = {"ok": False, "detail": "missing token"}
+        out["checks"]["send"] = {"ok": False, "detail": "missing token"}
+    else:
+        me = await tg.call("getMe", {})
+        out["checks"]["fetch"] = {
+            "ok": "error" not in me,
+            "detail": str(me.get("error", ""))[:200],
+        }
+
+        # 3. token
+        info = me.get("result", {}) if me.get("ok") else {}
+        out["checks"]["token"] = {
+            "ok": bool(me.get("ok")),
+            "bot_username": info.get("username", ""),
+            "bot_id": info.get("id", ""),
+            "detail": "" if me.get("ok") else str(me.get("description", me.get("error", "")))[:200],
+        }
+
+        # 4. webhook
+        hook = await tg.get_webhook_info()
+        detail = hook.get("result", {}) if hook.get("ok") else {}
+        out["checks"]["webhook"] = {
+            "ok": bool(detail.get("url")) and not detail.get("last_error_message"),
+            "url": detail.get("url", ""),
+            "pending": detail.get("pending_update_count", 0),
+            "last_error": detail.get("last_error_message", ""),
+        }
+
+        # 5. an actual send, to the owner chat if we know it
+        target = str(getattr(env, "TELEGRAM_CHAT_ID", "") or "")
+        if not target:
+            try:
+                target = str(await store.get(KEY_OWNER_CHAT, "") or "")
+            except Exception:
+                target = ""
+        if target:
+            sent = await tg.send(
+                "🧪 فحص ذاتي من الرادار — إذا وصلتك هذه الرسالة فالإرسال يعمل.",
+                target,
+            )
+            out["checks"]["send"] = {
+                "ok": bool(sent.get("ok")),
+                "chat_id": target,
+                "detail": "" if sent.get("ok") else str(sent.get("error", sent.get("description", "")))[:200],
+            }
+        else:
+            out["checks"]["send"] = {
+                "ok": False,
+                "chat_id": "",
+                "detail": "لا يوجد مالك بعد — أرسل /start للبوت لتصبح المالك، ثم أعد الفحص",
+            }
+
+    # 6. ai
+    out["checks"]["ai"] = {
+        "ok": getattr(env, "AI", None) is not None,
+        "model": str(getattr(env, "AI_MODEL", "") or ""),
+        "detail": "" if getattr(env, "AI", None) is not None else "no AI binding; narrated deterministically",
+    }
+
+    # 7. clock
+    out["checks"]["clock"] = {"ok": True, "utc": datetime.now(UTC).isoformat()}
+
+    out["ok"] = all(c.get("ok") for c in out["checks"].values())
+    return out
 
 
 async def track_outcomes_async(env, fetch, cfg: Optional[Config] = None) -> dict:

@@ -114,8 +114,13 @@ def to_response(payload: Any):
     # Already a Response (runtime, or one this module built earlier).
     if isinstance(payload, PlainResponse):
         return payload
-    if _Response is not None and isinstance(payload, _Response):
-        return payload
+    # `isinstance` against a non-class raises, and this is the last function
+    # before a blank 1101 page — so never let the check itself throw.
+    try:
+        if _Response is not None and isinstance(payload, _Response):
+            return payload
+    except TypeError:
+        pass
 
     text = _as_text(body)
     if "content-type" not in {k.lower() for k in headers}:
@@ -156,3 +161,63 @@ def crash_response(exc: Exception):
         default=str,
     )
     return to_response((body, {"status": 500, "content-type": "application/json; charset=utf-8"}))
+
+
+# ── the other side of the boundary: calling out ─────────────────────────────
+def as_fetcher(fetch):
+    """Wrap a fetch implementation so every caller can use one calling shape.
+
+    There are three fetch implementations in play and they disagree:
+
+        js.fetch(url, js_object)          # positional, needs a converted object
+        workers.fetch(url, **options)     # keyword-only:
+                                          #   async def fetch(resource, **other_options)
+        test/preview fakes: (url, dict)
+
+    Our code calls `(url, init_dict)` everywhere — `cta.telegram` and
+    `cta.sources.base` both do. Handing that to the SDK's fetch raises
+
+        TypeError: fetch() takes 1 positional argument but 2 were given
+
+    which surfaced to the operator as "⚠️ التوكن غير صالح ... fetch() takes 1
+    positional argument but 2 were given" — a token error message for what was
+    actually a calling-convention error. The token was fine the whole time.
+
+    This adapter accepts either shape and tries the call the way the underlying
+    implementation most likely wants, retrying the other way only when the
+    TypeError came from the call itself (traceback depth 1). That keeps a
+    genuine TypeError raised *inside* fetch from being retried and doubled.
+    """
+    if fetch is None:
+        return None
+    if getattr(fetch, "_cta_fetcher", False):
+        return fetch
+
+    async def adapter(url, init=None, **options):
+        opts: dict = {}
+        if isinstance(init, dict):
+            opts.update(init)
+        elif init is not None:  # (url, status) is not meaningful, ignore
+            opts.update(options)
+        else:
+            opts.update(options)
+
+        result = None
+        try:
+            result = fetch(url, opts)
+            if hasattr(result, "__await__"):
+                result = await result
+            return result
+        except TypeError as exc:
+            if exc.__traceback__ is None or exc.__traceback__.tb_next is not None:
+                raise  # raised inside fetch, not by the call itself
+            if not opts:
+                raise
+        # Retry in keyword form: the SDK's fetch(resource, **other_options).
+        result = fetch(url, **opts)
+        if hasattr(result, "__await__"):
+            result = await result
+        return result
+
+    adapter._cta_fetcher = True
+    return adapter
