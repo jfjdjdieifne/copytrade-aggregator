@@ -25,6 +25,7 @@ from .ai import (  # noqa: F401
 from .config import Config
 from .state import (
     KEY_OWNER_CHAT,
+    KEY_TRACE,
     KEY_STATS,
     KEY_WATCHLIST,
     Store,
@@ -68,6 +69,9 @@ class Bot:
         # Anyone who finds the bot can talk to it and burn the shared Workers AI
         # allowance (10k neurons/day on the free plan). When the owner's chat is
         # known, everyone else gets a polite refusal instead of a conversation.
+        await self._note("update", {"chat_id": chat_id, "kind": parsed["kind"],
+                                    "text": (text or "")[:60]})
+
         if parse_update_is_whoami(text):
             info = await self.tg.call("getMe", {})
             me = info.get("result", {}) if info.get("ok") else {}
@@ -85,6 +89,7 @@ class Bot:
             await self.tg.send(
                 "هذا البوت خاص. غير مصرّح لهذه المحادثة.", chat_id
             )
+            await self._note("refused", {"chat_id": chat_id})
             return {"handled": False, "reason": "chat not allowed", "chat_id": chat_id}
         if claimed:
             await self.tg.send(
@@ -110,13 +115,38 @@ class Bot:
 
         if text.startswith("/"):
             reply, keyboard = await self._route_command(text, chat_id)
-            await self.tg.send(reply, chat_id, keyboard=keyboard or main_keyboard())
-            return {"handled": True, "kind": "command"}
+            sent = await self.tg.send(reply, chat_id, keyboard=keyboard or main_keyboard())
+            await self._note("reply", {"chat_id": chat_id, "ok": bool(sent.get("ok")),
+                                       "error": str(sent.get("error", ""))[:200],
+                                       "bytes": len(reply or "")})
+            if not sent.get("ok"):
+                # The send failed. Surface it instead of pretending success.
+                return {"handled": True, "kind": "command",
+                        "delivered": False, "error": sent.get("error", "")[:200]}
+            return {"handled": True, "kind": "command", "delivered": True}
 
         await self.tg.typing(chat_id)
         reply = await self._converse(text, chat_id)
-        await self.tg.send(reply, chat_id, keyboard=main_keyboard())
-        return {"handled": True, "kind": "chat"}
+        sent = await self.tg.send(reply, chat_id, keyboard=main_keyboard())
+        await self._note("reply", {"chat_id": chat_id, "ok": bool(sent.get("ok")),
+                                   "error": str(sent.get("error", ""))[:200],
+                                   "bytes": len(reply or "")})
+        return {"handled": True, "kind": "chat", "delivered": bool(sent.get("ok"))}
+
+    async def _note(self, event: str, detail: dict) -> None:
+        """Append to a small ring buffer so /selftest can show what happened.
+
+        Every failure in this project so far was silent: a 200 to Telegram, a
+        swallowed store error, a wrong-looking token. Recording the last few
+        events turns "the bot does not answer" into something inspectable.
+        """
+        try:
+            entry = {"t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                     "event": event}
+            entry.update(detail)
+            await self.store.append(KEY_TRACE, entry, cap=12)
+        except Exception:
+            pass
 
     async def _is_owner(self, chat_id: str) -> tuple[bool, bool]:
         """Decide whether this chat may use the bot. Returns (allowed, claimed).

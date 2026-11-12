@@ -37,7 +37,7 @@ from .dashboard import (
 )
 from .http_bridge import as_fetcher
 from .telegram import Telegram
-from .state import KEY_OWNER_CHAT, KEY_PUBLIC_BASE, get_signals, get_watchlist, store_from_env
+from .state import KEY_OWNER_CHAT, KEY_PUBLIC_BASE, KEY_TRACE, get_signals, get_watchlist, store_from_env
 
 JSON_HEADERS = {
     "content-type": "application/json; charset=utf-8",
@@ -117,18 +117,80 @@ def _method(request) -> str:
 
 
 async def _body_json(request) -> dict:
-    try:
-        if hasattr(request, "json"):
-            data = request.json()
+    """Read a JSON body from any of the request shapes we may be handed.
+
+    The SDK's `Request` (workers-py `request.py`) exposes `js_object`,
+    `async text()`, `async json()`, `async bytes()` — and **no `.body`
+    attribute** (only `.body` as a JS ReadableStream property on the underlying
+    object). The previous version checked `hasattr(request, "json")` first and
+    then fell back to `.body`, so on the real Request it returned `{}`.
+
+    That failure was invisible and destructive: an empty dict means
+    `parse_update` returns None, the handler answers `{"handled": false}` with
+    HTTP 200, and Telegram — seeing success — **drops the message permanently**.
+    The bot looks alive (getMe works, the webhook is registered) but never
+    replies to anything.
+    """
+    # 1. an async json()/text() (test fakes, the SDK, our own wrappers)
+    for method in ("json", "text", "bytes"):
+        fn = getattr(request, method, None)
+        if not callable(fn):
+            continue
+        try:
+            data = fn()
             if hasattr(data, "__await__"):
                 data = await data
-            return data if isinstance(data, dict) else {}
-        raw = getattr(request, "body", "")
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", "replace")
-        return json.loads(raw or "{}")
-    except Exception:
-        return {}
+        except Exception:
+            continue
+        parsed = _coerce_json(data)
+        if parsed is not None:
+            return parsed
+
+    # 2. a plain body attribute
+    raw = getattr(request, "body", None)
+    parsed = _coerce_json(raw)
+    if parsed is not None:
+        return parsed
+
+    # 3. the underlying JS Request
+    js_object = getattr(request, "js_object", None)
+    if js_object is not None:
+        try:
+            text = js_object.text()
+            if hasattr(text, "then") or hasattr(text, "__await__"):
+                text = await text
+            parsed = _coerce_json(text)
+            if parsed is not None:
+                return parsed
+        except Exception:
+            pass
+
+    return {}
+
+
+def _coerce_json(value):
+    """Best-effort dict out of whatever a body accessor returned."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", "replace")
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    # An already-parsed object proxy: fall back to .to_py() if it offers one.
+    to_py = getattr(value, "to_py", None)
+    if callable(to_py):
+        try:
+            parsed = to_py()
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
 
 
 async def _unavailable_fetch(*_args, **_kwargs):
@@ -246,7 +308,36 @@ async def _dispatch(request, env, ctx, fetcher):
                 if got != expected_secret:
                     return _json({"ok": False, "error": "bad secret"}, 403)
             update = await _body_json(request)
-            result = await handle_telegram_async(env, fetcher, update)
+            if not update:
+                # Never answer 200 to a body we could not read: Telegram treats
+                # 200 as delivered and drops the message for good. A non-2xx
+                # makes it retry, so a bug costs a retry instead of a message.
+                return _json(
+                    {
+                        "ok": False,
+                        "error": "empty or unreadable update body",
+                        "hint": "the webhook received a request it could not parse",
+                    },
+                    400,
+                )
+            try:
+                result = await handle_telegram_async(env, fetcher, update)
+            except Exception as exc:
+                # Same reason: let Telegram retry and keep evidence in the reply.
+                import traceback
+
+                return _json(
+                    {
+                        "ok": False,
+                        "error": f"{type(exc).__name__}: {exc}"[:300],
+                        "where": traceback.format_exc().splitlines()[-3:],
+                    },
+                    500,
+                )
+            if not result.get("handled"):
+                # Handled but ignored (wrong chat, unknown update) is a real
+                # answer: 200 is correct there, and the reason is reported.
+                return _json(result)
             return _json(result)
 
         if path in ("/telegram/setup", "/setup", "/setup.json", "/telegram/setup.json"):
@@ -305,6 +396,14 @@ async def _dispatch(request, env, ctx, fetcher):
                 await store.set(KEY_PUBLIC_BASE, base)
             except Exception:
                 pass
+            try:
+                trace = await store.get(KEY_TRACE, []) or []
+            except Exception:
+                trace = []
+            try:
+                all_updates = int(detail.get("pending_update_count", 0))
+            except (TypeError, ValueError):
+                all_updates = 0
 
             result = {
                 "ok": bool(hook.get("ok")),
@@ -319,7 +418,8 @@ async def _dispatch(request, env, ctx, fetcher):
                 "dashboard": f"{base}/dash",
                 "secret_registered": bool(secret),
                 "chat_id_set": bool(chat_id),
-                "pending_updates": detail.get("pending_update_count", 0),
+                "pending_updates": all_updates,
+                "trace": trace[-8:],
                 "last_error": detail.get("last_error_message", ""),
                 "telegram_said": hook.get("description", ""),
                 "token_ok": bool(me.get("ok")),
@@ -344,6 +444,7 @@ async def _dispatch(request, env, ctx, fetcher):
                     token_ok=result["token_ok"],
                     token_error=result["token_error"],
                     pending_updates=result["pending_updates"],
+                    trace=result["trace"],
                     owner_linked=result["owner_linked"],
                     ai_binding=result["ai_binding"],
                 ),

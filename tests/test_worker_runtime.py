@@ -1493,3 +1493,182 @@ async def test_selftest_json_is_machine_readable():
     env = _env(TELEGRAM_BOT_TOKEN="1:x")
     body = _body(await handle(FakeRequest("https://w.dev/selftest.json"), env, fetch=_TGAny()))
     assert set(body["checks"]) >= {"state", "token", "webhook", "send", "ai", "clock"}
+
+
+# ── reading a real Telegram webhook body ────────────────────────────────────
+class _SdkRequest:
+    """The SDK's Request: async text()/json(), js_object, NO .body attribute.
+
+    workers-py request.py defines text(), json(), bytes() as async methods and
+    exposes the JS object as .js_object. There is no Python `.body` attribute.
+    """
+
+    def __init__(self, payload, url="https://w.dev/telegram"):
+        self._payload = payload
+        self.url = url
+        self.method = "POST"
+        self.headers = {}
+        self.js_object = _JsBody(payload)
+
+    async def text(self):
+        return json.dumps(self._payload)
+
+    async def json(self):
+        return self._payload
+
+
+class _JsBody:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def text(self):
+        async def _t():
+            return json.dumps(self._payload)
+
+        return _t()
+
+
+async def test_the_sdk_request_body_is_read_not_silently_dropped():
+    """This was THE reason the bot never replied.
+
+    `_body_json` looked for `.json()` then `.body`. The SDK Request has neither
+    as a plain attribute, so it returned `{}`; `parse_update({})` returned None;
+    the handler answered `{"handled": false}` with **HTTP 200**; and Telegram,
+    seeing success, dropped the message permanently. getMe and the webhook both
+    looked perfect, so every visible signal said "fine".
+    """
+    from cta.worker import _body_json
+
+    update = {"update_id": 1, "message": {"text": "/start", "chat": {"id": 555}}}
+    got = await _body_json(_SdkRequest(update))
+    assert got["update_id"] == 1
+    assert got["message"]["text"] == "/start"
+
+
+async def test_a_real_webhook_post_produces_a_reply():
+    """End to end through the route, with an SDK-shaped request."""
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    tg = _TGAny()
+    update = _tg_update(chat_id=555, text="/start")
+    body = _body(await handle(_SdkRequest(update), env, fetch=tg))
+
+    assert body.get("handled") is True
+    assert body.get("delivered") is True
+    assert any("تم ربط هذه المحادثة" in m.get("text", "") for m in tg.sent)
+
+
+async def test_an_unreadable_body_returns_4xx_so_telegram_retries():
+    """200 on an empty body tells Telegram to give up on that message."""
+    from cta.worker import handle
+
+    class NoBody:
+        url = "https://w.dev/telegram"
+        method = "POST"
+        headers = {}
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    raw = await handle(NoBody(), env, fetch=_TGAny())
+    text, headers = raw
+    assert headers["status"] == 400
+    assert "unreadable" in json.loads(text)["error"]
+
+
+async def test_a_handler_crash_returns_500_so_telegram_retries():
+    from cta.worker import handle
+
+    class Exploding:
+        url = "https://w.dev/telegram"
+        method = "POST"
+        headers = {}
+
+        def json(self):
+            return {"update_id": 1, "message": {"text": "/start", "chat": {"id": 1}}}
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    env.STATE = None  # MemoryStore fallback is fine; make the bot explode instead
+
+    async def boom(*a, **k):
+        raise RuntimeError("handler exploded")
+
+    import cta.worker as W
+
+    original = W.handle_telegram_async
+    W.handle_telegram_async = boom
+    try:
+        raw = await W.handle(Exploding(), env, fetch=_TGAny())
+    finally:
+        W.handle_telegram_async = original
+
+    text, headers = raw
+    assert headers["status"] == 500
+    assert "exploded" in json.loads(text)["error"]
+
+
+async def test_the_reply_delivery_result_is_reported():
+    """A failed send must not be reported as handled-and-fine."""
+    from cta.runtime import handle_telegram_async
+
+    class FailsToSend(_TGAny):
+        async def __call__(self, url, init=None, **kw):
+            if url.endswith("/sendMessage"):
+                class R:
+                    status = 400
+
+                    async def json(self):
+                        return {"ok": False, "description": "Bad Request: chat not found"}
+
+                return R()
+            return await super().__call__(url, init, **kw)
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    result = await handle_telegram_async(env, FailsToSend(), _tg_update(chat_id=555))
+    assert result.get("delivered") is False
+    assert "chat not found" in result.get("error", "")
+
+
+async def test_the_trace_records_what_actually_happened():
+    """/setup shows this, so "no reply" becomes inspectable."""
+    from cta.runtime import handle_telegram_async
+    from cta.state import KEY_TRACE, store_from_env
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x")
+    await handle_telegram_async(env, _TGAny(), _tg_update(chat_id=555, text="/start"))
+    trace = await store_from_env(env).get(KEY_TRACE, [])
+
+    events = [t["event"] for t in trace]
+    assert "update" in events
+    assert "reply" in events
+    reply = [t for t in trace if t["event"] == "reply"][-1]
+    assert reply["ok"] is True
+
+
+async def test_setup_page_shows_the_trace_and_any_webhook_error():
+    from cta.state import KEY_TRACE, store_from_env
+    from cta.worker import handle
+
+    env = _env(TELEGRAM_BOT_TOKEN="1:x", WORKER_URL="https://w.dev")
+    await store_from_env(env).append(
+        KEY_TRACE, {"t": "2026-11-12T18:00:00", "event": "update", "text": "/start"}, cap=12
+    )
+
+    class WithError(_TGAny):
+        async def __call__(self, url, init=None, **kw):
+            if url.endswith("/getWebhookInfo"):
+                class R:
+                    status = 200
+
+                    async def json(self):
+                        return {"ok": True, "result": {
+                            "url": "https://w.dev/telegram",
+                            "pending_update_count": 2,
+                            "last_error_message": "Connection refused",
+                        }}
+
+                return R()
+            return await super().__call__(url, init, **kw)
+
+    html, _ = await handle(FakeRequest("https://w.dev/setup"), env, fetch=WithError())
+    assert "Connection refused" in html
+    assert "/start" in html

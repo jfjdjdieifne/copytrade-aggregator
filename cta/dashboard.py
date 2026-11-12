@@ -371,6 +371,7 @@ def render_setup_page(
     pending_updates: int = 0,
     owner_linked: bool = False,
     ai_binding: bool = True,
+    trace: list | None = None,
 ) -> str:
     """Human-readable first-run page.
 
@@ -446,6 +447,30 @@ def render_setup_page(
         ),
     ]
 
+    if last_error:
+        hero += (
+            '<div class="hero bad" style="margin-top:10px"><b>⚠️ تلغرام يقول إن الوصول فشل</b>'
+            f"آخر خطأ سجّله تلغرام عند محاولة تسليم رسالة إلى هذا الـ Worker: "
+            f"<code>{html.escape(last_error)}</code><br>"
+            "هذا يعني أن الربط مسجَّل لكن الرسائل ترتد. أعد النشر ثم أعد تحميل الصفحة.</div>"
+        )
+
+    if trace:
+        rows = "".join(
+            f"<div class=\"tl\"><span class=\"tt\">{html.escape(str(t.get('t',''))[-8:])}</span>"
+            f"<span class=\"te\">{html.escape(str(t.get('event','')))}</span>"
+            f"<span class=\"td\">{html.escape(str(t.get('error','') or t.get('text','') or ''))[:90]}</span></div>"
+            for t in reversed(trace[-6:])
+        )
+        hero += (
+            '<details style="margin-top:10px"><summary>آخر الرسائل التي وصلت الـ Worker</summary>'
+            f'<div class="traces">{rows}</div>'
+            "<p style=\"font-size:12px;color:#8fa3b8\">"
+            "إن كانت هذه القائمة فاضية تماماً فمعناه أن تلغرام لا يصل إلى هنا أصلاً. "
+            "وإن كانت فيها سطور فمعناه أن الرسائل تصل والرد هو الذي يفشل — وهذا يوضّح أين المشكلة.</p>"
+            "</details>"
+        )
+
     if pending_updates and ok:
         hero += (
             '<div class="hero bad" style="margin-top:10px"><b>⚠️ رسائل لم تُعالَج</b>'
@@ -481,7 +506,13 @@ def render_setup_page(
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b0f14">
 <title>تهيئة تلغرام — رادار الإجماع</title>
-<style>{_SETUP_CSS}</style>
+<style>{_SETUP_CSS}
+.traces{{margin-top:8px}}
+.tl{{display:flex;gap:8px;padding:6px 8px;border-bottom:1px solid #232c36;font-size:12px;align-items:center}}
+.tt{{color:#63e6a0;direction:ltr;font-variant-numeric:tabular-nums}}
+.te{{color:#f2cf72;min-width:64px}}
+.td{{color:#8fa3b8;flex:1;word-break:break-all}}
+</style>
 </head>
 <body>
 <h1>🔗 تهيئة تلغرام</h1>
