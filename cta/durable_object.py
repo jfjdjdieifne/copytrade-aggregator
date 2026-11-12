@@ -13,7 +13,6 @@ between Python code and the runtime.
 
 from __future__ import annotations
 
-import json
 
 try:  # Cloudflare runtime
     from workers import DurableObject  # type: ignore
@@ -34,134 +33,139 @@ except Exception:  # pragma: no cover - local test runs
 
 
 class RadarState(DurableObject):
-    """Key/value storage with bounded append lists, on top of DO SQLite."""
+    """Key/value storage on the Durable Object's KV API.
+
+    Why not SQL
+    -----------
+    The SQLite API returns a `SqlStorageCursor`. In Python each row comes back as
+    a `pyodide.ffi.JsProxy`, and `row["v"]` raises
+
+        TypeError: 'pyodide.ffi.JsProxy' object is not subscriptable
+
+    which is exactly what the live bot reported. Converting proxies correctly
+    means knowing the exact Pyodide version's semantics, per row, on every read —
+    a lot of surface area for a key/value store.
+
+    The KV API is what Cloudflare's own documentation uses for this purpose:
+
+        value = (await self.ctx.storage.get("value")) or 0
+        await self.ctx.storage.put("value", value)
+
+    It is async, returns and accepts **Python** values (no cursors, no proxies),
+    and needs no schema. This class stores the JSON strings `DurableStore`
+    already produces, so the contract above it is unchanged.
+
+    One Durable Object instance is still the right primitive: it serialises the
+    cron, the webhook-less poller and any manual command onto one writer.
+    """
 
     def __init__(self, ctx, env=None):
-        # `DurableObject.__init__(self, ctx, env)` takes TWO arguments — verified
-        # against the built-in module and the official docs:
-        #
-        #     class Counter(DurableObject):
-        #         def __init__(self, ctx, env):
-        #             super().__init__(ctx, env)
-        #
-        # Calling `super().__init__(ctx)` raises
-        #     TypeError: DurableObject.__init__() missing 1 required positional
-        #     argument: 'env'
-        # which breaks instantiation, so every RPC call fails and the HTTP
-        # handler returns 500. Telegram reported exactly that:
-        #     Wrong response from the webhook: 500 Internal Server Error
-        #
-        # `env` is defaulted so the class still imports and instantiates in
-        # tests where only a context exists.
         super().__init__(ctx, env)
-        self._initialised = False
 
-    async def _ensure_schema(self) -> None:
-        if self._initialised:
-            return
-        sql = self._sql()
-        if sql is not None:
-            sql.exec(
-                "CREATE TABLE IF NOT EXISTS kv ("
-                "  k TEXT PRIMARY KEY,"
-                "  v TEXT NOT NULL"
-                ")"
-            )
-        self._initialised = True
+    # ── async KV, with a sync fallback for older runtimes ────────────────────
+    def _storage(self):
+        return getattr(self.ctx, "storage", None)
 
-    def _sql(self):
-        """The DO SQL handle, or None on a KV-backed object."""
-        return getattr(getattr(self.ctx, "storage", None), "sql", None)
-
-    def _rows(self, cursor):
-        """Materialise a `SqlStorageCursor` into a Python list of dicts.
-
-        In Python the DO SQL API is **synchronous** — the docs show
-        `self.sql.exec(...)` with no `await`, and `exec` returns a cursor, not a
-        promise. Our code awaited both the call and `toArray()`, which raises
-            TypeError: object SqlStorageCursor can't be used in 'await' expression
-        A cursor is iterable, so collecting it is the reliable path.
-        """
-        if cursor is None:
-            return []
-        rows = getattr(cursor, "toArray", None)
-        if callable(rows):
-            try:
-                return list(rows())
-            except Exception:
-                pass
-        try:
-            return list(cursor)
-        except TypeError:
-            return []
-
-    async def _maybe(self, value):
-        """Await only when the platform actually returned a promise."""
+    async def _get(self, key: str):
+        storage = self._storage()
+        if storage is None:
+            return None
+        fn = getattr(storage, "get", None)
+        if fn is None:
+            return None
+        value = fn(key)
         if hasattr(value, "__await__"):
-            return await value
+            value = await value
         return value
 
-    async def storage_get(self, key: str):
-        await self._ensure_schema()
-        sql = self._sql()
-        if sql is None:  # pragma: no cover - KV-backed object
-            return await self._maybe(self.ctx.storage.get(key))
-        rows = self._rows(sql.exec("SELECT v FROM kv WHERE k = ?", key))
-        if not rows:
+    async def _put(self, key: str, value) -> None:
+        storage = self._storage()
+        if storage is None:
+            return
+        fn = getattr(storage, "put", None)
+        if fn is None:
+            return
+        result = fn(key, value)
+        if hasattr(result, "__await__"):
+            await result
+
+    async def _delete(self, key: str) -> None:
+        storage = self._storage()
+        if storage is None:
+            return
+        fn = getattr(storage, "delete", None)
+        if fn is None:
+            return
+        result = fn(key)
+        if hasattr(result, "__await__"):
+            await result
+
+    @staticmethod
+    def _to_text(value):
+        """Normalise whatever came back into a str, or None.
+
+        The KV API can hand back a JsProxy for values written by another
+        language. Everything here is JSON written by `DurableStore`, so the
+        common path is a plain str; the rest is defensive.
+        """
+        if value is None:
             return None
-        row = rows[0]
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            return value.decode("utf-8", "replace")
+        for method in ("to_py", "toString"):
+            fn = getattr(value, method, None)
+            if callable(fn):
+                try:
+                    converted = fn()
+                    if isinstance(converted, str):
+                        return converted
+                    if converted is not None and not hasattr(converted, "to_py"):
+                        return str(converted) if not isinstance(converted, (dict, list)) else None
+                except Exception:
+                    continue
         try:
-            return row["v"]
-        except (TypeError, KeyError, IndexError):
-            return row[0]
+            return str(value)
+        except Exception:
+            return None
+
+    # ── the RPC surface `DurableStore` calls ────────────────────────────────
+    async def storage_get(self, key: str):
+        return self._to_text(await self._get(key))
 
     async def storage_set(self, key: str, value: str) -> None:
-        await self._ensure_schema()
-        sql = self._sql()
-        if sql is None:  # pragma: no cover
-            await self._maybe(self.ctx.storage.put(key, value))
-            return
-        sql.exec(
-            "INSERT INTO kv (k, v) VALUES (?, ?) "
-            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            key,
-            value,
-        )
+        await self._put(key, value)
 
     async def storage_append(self, key: str, item: str, cap: int = 500) -> str:
         """Append to a JSON list, keeping only the newest `cap` entries.
 
         `item` arrives JSON-encoded from `DurableStore.append`, so it is decoded
-        before being stored — otherwise the list would fill with JSON *strings*
-        and every reader would have to double-decode.
+        before storage — otherwise readers would have to double-decode.
         """
-        await self._ensure_schema()
+        import json as _json
+
         current = await self.storage_get(key)
         try:
-            items = json.loads(current) if current else []
+            items = _json.loads(current) if current else []
             if not isinstance(items, list):
                 items = []
         except (TypeError, ValueError):
             items = []
 
         try:
-            items.append(json.loads(item))
+            items.append(_json.loads(item))
         except (TypeError, ValueError):
             items.append(item)
         if len(items) > cap:
             items = items[-cap:]
 
-        payload = json.dumps(items)
-        await self.storage_set(key, payload)
+        payload = _json.dumps(items)
+        await self._put(key, payload)
         return payload
 
     async def storage_delete(self, key: str) -> None:
-        await self._ensure_schema()
-        sql = self._sql()
-        if sql is None:  # pragma: no cover
-            await self._maybe(self.ctx.storage.delete(key))
-            return
-        sql.exec("DELETE FROM kv WHERE k = ?", key)
+        await self._delete(key)
 
     async def fetch(self, request=None):  # pragma: no cover - RPC surface
         return None

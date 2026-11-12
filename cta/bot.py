@@ -224,7 +224,16 @@ class Bot:
         The claim is deliberately sticky: one bot, one owner.
         """
         env_owner = str(getattr(self.env, "TELEGRAM_CHAT_ID", "") or "").strip()
-        stored = str(await self.store.get(KEY_OWNER_CHAT, "") or "").strip()
+        try:
+            stored = str(await self.store.get(KEY_OWNER_CHAT, "") or "").strip()
+        except Exception:
+            # A broken store must not turn every message into "unexpected error".
+            # Ownership is a convenience; answering is the product. Degrade to
+            # the configured chat (or open, if unset) and do not claim, because
+            # a claim that cannot be persisted would not survive the next call.
+            if env_owner:
+                return str(chat_id) == env_owner, False
+            return True, False
 
         if env_owner:
             return str(chat_id) == env_owner, False
@@ -232,7 +241,10 @@ class Bot:
             return str(chat_id) == stored, False
 
         # Nothing configured and nobody has claimed it yet: take this chat.
-        await self.store.set(KEY_OWNER_CHAT, str(chat_id))
+        try:
+            await self.store.set(KEY_OWNER_CHAT, str(chat_id))
+        except Exception:
+            return True, False
         return True, True
 
     # ── commands ────────────────────────────────────────────────────────────
