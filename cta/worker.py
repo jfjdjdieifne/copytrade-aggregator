@@ -61,6 +61,33 @@ def _path(request) -> str:
     return (path[idx:] if idx >= 0 else "/").split("?")[0].rstrip("/") or "/"
 
 
+def _origin(request) -> str:
+    """Reconstruct the public base URL from the request itself.
+
+    Cloudflare gives us the full URL the client used, so the Worker can discover
+    its own address. That removes the main first-run failure mode: a placeholder
+    or mistyped WORKER_URL silently pointing Telegram at a host that does not
+    exist, which makes the bot look dead with no error anywhere.
+    """
+    url = getattr(request, "url", "") or ""
+    if "://" in url:
+        scheme, _, rest = url.partition("://")
+        host = rest.split("/", 1)[0]
+        if host:
+            return f"{scheme}://{host}"
+    return ""
+
+
+def _configured_base(env) -> str:
+    """WORKER_URL if it is real, otherwise "" so callers can fall back."""
+    raw = str(getattr(env, "WORKER_URL", "") or "").strip().rstrip("/")
+    # The shipped wrangler.toml value contains "<your-subdomain>"; treat any
+    # angle bracket as "not configured" rather than registering it with Telegram.
+    if not raw or "<" in raw or ">" in raw:
+        return ""
+    return raw
+
+
 def _method(request) -> str:
     return (getattr(request, "method", "GET") or "GET").upper()
 
@@ -111,7 +138,7 @@ def _default_fetch(env):
         return _unavailable_fetch
 
 
-async def _dashboard_html(store) -> str:
+async def _dashboard_html(store, base_url: str = "") -> str:
     """Render the live dashboard from whatever the last cron cycle stored.
 
     Everything here comes out of the Durable Object, so this page is a window on
@@ -137,6 +164,7 @@ async def _dashboard_html(store) -> str:
         live=bool(health) and any(health.values()),
         source_health=health,
         last_cycle=last,
+        base_url=base_url,
     )
 
 
@@ -159,20 +187,21 @@ async def handle(request, env, ctx=None, fetch=None):
             result = await handle_telegram_async(env, fetcher, update)
             return _json(result)
 
-        if path == "/telegram/setup":
+        if path in ("/telegram/setup", "/setup"):
             # Deliberately a GET so it can be run from a phone's address bar:
             # there is no easy way to send a POST from mobile Safari/Chrome, and
             # needing one was the main reason first-run setup was painful.
             token = str(getattr(env, "TELEGRAM_BOT_TOKEN", "") or "")
-            base = str(getattr(env, "WORKER_URL", "") or "").rstrip("/")
             secret = str(getattr(env, "TELEGRAM_WEBHOOK_SECRET", "") or "")
+            # Prefer the configured URL, but fall back to what the browser used.
+            base = _configured_base(env) or _origin(request)
 
             if not token or not base:
                 return _json(
                     {
                         "ok": False,
-                        "error": "TELEGRAM_BOT_TOKEN or WORKER_URL is not set",
-                        "hint": "Add both in Settings > Variables and Secrets, then reload this page",
+                        "error": "TELEGRAM_BOT_TOKEN is not set",
+                        "hint": "Add it in Settings > Variables and Secrets, then reload this page",
                     },
                     400,
                 )
@@ -186,6 +215,9 @@ async def handle(request, env, ctx=None, fetch=None):
                     "ok": bool(hook.get("ok")),
                     "registered_url": detail.get("url", ""),
                     "expected_url": f"{base}/telegram",
+                    "worker_url": base,
+                    "worker_url_source": "WORKER_URL var" if _configured_base(env) else "auto-detected",
+                    "dashboard": f"{base}/dash",
                     "secret_registered": bool(secret),
                     "pending_updates": detail.get("pending_update_count", 0),
                     "last_error": detail.get("last_error_message", ""),
@@ -195,7 +227,7 @@ async def handle(request, env, ctx=None, fetch=None):
 
         if path in ("/", "/status", "/dash"):
             store = store_from_env(env)
-            html = await _dashboard_html(store)
+            html = await _dashboard_html(store, _configured_base(env) or _origin(request))
             return (html, {"status": 200, "content-type": "text/html; charset=utf-8"})
 
         if path == "/health":

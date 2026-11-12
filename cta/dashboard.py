@@ -129,6 +129,7 @@ def render_dashboard(
     live: bool = False,
     source_health: Optional[dict] = None,
     last_cycle: str = "—",
+    base_url: str = "",
 ) -> str:
     """Return the full HTML page as a string."""
     banner = (
@@ -137,6 +138,18 @@ def render_dashboard(
         else '<div class="banner demo">🟡 عرض تجريبي — هذه البيئة لا تصل لمنصات التداول'
         "<br><small>الأرقام أدناه محسوبة بالكود الحقيقي على بيانات تجريبية، "
         "ولتوليد إشارات حيّة انشر الـ Worker على Cloudflare أو شغّله من جهازك.</small></div>"
+    )
+
+    # On a live deployment, show the addresses that matter instead of making the
+    # user hunt through the Cloudflare dashboard for their Worker URL.
+    links = (
+        f'<div class="links">'
+        f'<div><label>رابط الـ Worker</label><code>{html.escape(base_url)}</code></div>'
+        f'<div><label>ربط تلغرام</label>'
+        f'<code>{html.escape(base_url)}/telegram/setup</code></div>'
+        f"</div>"
+        if base_url
+        else ""
     )
 
     health = source_health or {}
@@ -195,6 +208,10 @@ header.top{{display:flex;justify-content:space-between;align-items:flex-start;ga
 .banner.demo{{background:#2a2113;border:1px solid #5c4a1d;color:#f2cf72}}
 .banner.live{{background:#0f2417;border:1px solid #1e4d2b;color:#63e6a0}}
 .pills{{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}}
+.links{{background:var(--card);border:1px solid var(--line);border-radius:12px;
+ padding:10px 12px;margin-bottom:14px;display:flex;flex-direction:column;gap:8px}}
+.links label{{display:block;font-size:10px;color:var(--dim);margin-bottom:2px}}
+.links code{{font-size:11px;word-break:break-all;color:#8ad8ff}}
 .pill{{font-size:11px;padding:4px 9px;border-radius:99px;background:#1a2129;border:1px solid var(--line)}}
 .pill.ok{{color:#63e6a0}} .pill.bad{{color:#ff8787}}
 .kpis{{display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-bottom:16px}}
@@ -262,6 +279,7 @@ footer.bottom{{margin-top:24px;font-size:10px;color:var(--dim);text-align:center
 </header>
 
 {banner}
+{links}
 <div class="pills">{health_html}</div>
 
 <div class="kpis">

@@ -485,3 +485,65 @@ def test_durable_object_init_matches_cloudflare_signature():
         if p.default is inspect.Parameter.empty
     ]
     assert required == [], "RadarState.__init__ must not require arguments beyond ctx"
+
+
+# ── the Worker discovers its own URL ────────────────────────────────────────
+async def test_setup_derives_worker_url_from_the_request():
+    """No WORKER_URL var needed: the request already carries the real host.
+
+    This is the fix for the placeholder value shipped in wrangler.toml — pointing
+    Telegram at "<your-subdomain>" made the bot silently dead with no error.
+    """
+    env = _env()
+    env.TELEGRAM_BOT_TOKEN = "123:abc"
+    env.WORKER_URL = "https://copytrade-aggregator.<your-subdomain>.workers.dev"
+    fetcher = _TGFetch()
+
+    result = await handle(
+        FakeRequest("https://copytrade-aggregator.abc.workers.dev/telegram/setup"),
+        env,
+        fetch=fetcher,
+    )
+    body = _body(result)
+
+    assert body["expected_url"] == "https://copytrade-aggregator.abc.workers.dev/telegram"
+    assert body["worker_url_source"] == "auto-detected"
+    assert body["dashboard"] == "https://copytrade-aggregator.abc.workers.dev/dash"
+
+
+async def test_setup_prefers_a_real_worker_url_var():
+    env = _env()
+    env.TELEGRAM_BOT_TOKEN = "123:abc"
+    env.WORKER_URL = "https://radar.example.com"
+    body = _body(await handle(FakeRequest("https://x.dev/telegram/setup"), env, fetch=_TGFetch()))
+    assert body["worker_url"] == "https://radar.example.com"
+    assert body["worker_url_source"] == "WORKER_URL var"
+
+
+async def test_short_setup_alias_works():
+    """Typing /setup on a phone keyboard is easier than /telegram/setup."""
+    env = _env()
+    env.TELEGRAM_BOT_TOKEN = "123:abc"
+    body = _body(await handle(FakeRequest("https://w.dev/setup"), env, fetch=_TGFetch()))
+    assert body["ok"] is True
+    assert body["expected_url"] == "https://w.dev/telegram"
+
+
+async def test_placeholder_url_is_never_registered():
+    """A value containing < or > must be treated as unset."""
+    from cta.worker import _configured_base
+
+    class E:
+        WORKER_URL = "https://copytrade-aggregator.<your-subdomain>.workers.dev"
+
+    assert _configured_base(E()) == ""
+
+
+async def test_dash_shows_its_own_url_and_setup_link():
+    """The dashboard answers "what is my Worker URL?" without the dashboard UI."""
+    env = _env()
+    body, _ = await handle(
+        FakeRequest("https://copytrade-aggregator.abc.workers.dev/dash"), env, fetch=FakeFetch({})
+    )
+    assert "https://copytrade-aggregator.abc.workers.dev" in body
+    assert "/telegram/setup" in body
