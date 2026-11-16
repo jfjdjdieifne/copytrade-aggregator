@@ -67,7 +67,19 @@ def load_env_file(path: str = ".env") -> dict[str, str]:
 def make_env() -> LocalEnv:
     merged = dict(os.environ)
     merged.update(load_env_file())
-    return LocalEnv(merged)
+    env = LocalEnv(merged)
+    # On a server there is no Durable Object, and `MemoryStore` would erase the
+    # watchlist, the de-dup set and the paper account on every restart. SQLite
+    # keeps them. A store that cannot be opened must be reported, not silently
+    # replaced by one that forgets everything.
+    try:
+        from .sqlite_store import open_store
+
+        env.STATE = open_store(os.environ.get("CTA_STATE_DB", "state.db"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[cta] durable store unavailable ({type(exc).__name__}: {exc}); "
+              f"falling back to memory — this run will forget everything")
+    return env
 
 
 # ── real network fetch (stdlib only) ─────────────────────────────────────────
@@ -177,6 +189,8 @@ async def cmd_track(env: LocalEnv) -> int:
 async def cmd_run(env: LocalEnv, interval: int = 60) -> int:
     """Long-running loop for a VPS — the Cloudflare cron equivalent."""
     print(f"▶ بدء الحلقة كل {interval} ثانية. Ctrl+C للإيقاف.")
+    if getattr(env, "SIM", "") in ("1", "true", "yes"):
+        print("  (SIM=1: المصادر مُفبرَكة — نفس خط الأنابيب، لا شبكة)")
     while True:
         started = time.monotonic()
         try:
@@ -201,6 +215,31 @@ async def cmd_chat(env: LocalEnv, question: str) -> int:
     return 0
 
 
+async def cmd_simulate(cycles: int = 12, traders: int = 40, seed: int = 7,
+                       quiet: bool = False) -> int:
+    """Run the real pipeline against the simulator.
+
+    Exists because the venues are unreachable from a dev machine: without it,
+    the first execution of this code would happen on the operator's own server,
+    at which point every bug is a surprise at 3am.
+    """
+    from .simulate import render_report, run_quiet_control, run_simulation
+
+    print("▶ محاكاة: نفس خط الأنابيب الحقيقي، سوق مُفبرك")
+    print(f"  {traders} متداول · {cycles} دورة · seed={seed}\n")
+
+    if quiet:
+        result = await run_quiet_control(cycles=cycles, n_traders=traders, seed=seed)
+        print("\n── شاهد سلبي (بلا توافقات محقونة) ──")
+        print(render_report(result))
+        print("\n✅ الشاهد السلبي: لا إشارات = النظام لا يخترع إجماعاً")
+        return 0
+
+    result = await run_simulation(cycles=cycles, n_traders=traders, seed=seed)
+    print(render_report(result))
+    return 0
+
+
 async def cmd_demo() -> int:
     """Fully offline end-to-end run with synthetic venues."""
     from .demo import run_demo
@@ -222,6 +261,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub.add_parser("scan", help="دورة مراقبة واحدة")
     sub.add_parser("track", help="تقييم الإشارات المخزنة")
     sub.add_parser("demo", help="عرض تجريبي كامل بلا إنترنت")
+    sim_p = sub.add_parser("simulate", help="تشغيل خط الأنابيب الحقيقي على محاكي")
+    sim_p.add_argument("--cycles", type=int, default=12)
+    sim_p.add_argument("--traders", type=int, default=40)
+    sim_p.add_argument("--seed", type=int, default=7)
+    sim_p.add_argument("--quiet", action="store_true",
+                       help="شاهد سلبي: بلا توافقات محقونة، يجب ألّا تصدر إشارات")
 
     run_p = sub.add_parser("run", help="حلقة مستمرة")
     run_p.add_argument("--interval", type=int, default=60)
@@ -232,6 +277,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
     command = args.cmd or "doctor"
 
+    if command == "simulate":
+        return asyncio.run(
+            cmd_simulate(
+                cycles=getattr(args, "cycles", 12),
+                traders=getattr(args, "traders", 40),
+                seed=getattr(args, "seed", 7),
+                quiet=getattr(args, "quiet", False),
+            )
+        )
     if command == "demo":
         return asyncio.run(cmd_demo())
 

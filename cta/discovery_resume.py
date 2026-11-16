@@ -103,6 +103,17 @@ def plan_slice(
     return max(0, min(affordable, total - cursor))
 
 
+def _venue_confirms_data(venue) -> bool:
+    """See `cta.engine._venue_confirms_data`.
+
+    Duplicated rather than imported: `discovery_resume` is imported *by*
+    `engine`, so importing back would be circular. The rule is one line, and
+    both copies must agree — `test_data_confirmation_is_not_a_hardcoded_source`
+    asserts exactly that.
+    """
+    return bool(getattr(venue, "data_confirmed", True))
+
+
 async def score_slice(
     candidates: Sequence,
     start: int,
@@ -178,7 +189,7 @@ async def score_slice(
                 fills,
                 account_value_usd=cand.account_value,
                 source=cand.source,
-                data_confirmed=cand.source == "hyperliquid",
+                data_confirmed=_venue_confirms_data(venue),
             )
             classify_trader(stats)
         except Exception as exc:

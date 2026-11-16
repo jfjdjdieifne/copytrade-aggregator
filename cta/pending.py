@@ -39,7 +39,7 @@ from typing import Iterable, Optional, Sequence
 from .config import GRADE_ORDER, Config
 from .convergence import detect_convergence
 from .models import BPS, Cluster, Order, Position
-from .orders import DEFAULT_MAX_ORDER_AGE_MIN, fresh
+from .orders import DEFAULT_MAX_ORDER_AGE_MIN, attach_protective, fresh
 
 UTC = timezone.utc
 
@@ -173,5 +173,12 @@ def detect_pending(
     ]
     if not pool:
         return []
+
+    # Their stops and targets are the entire reason a pending signal is worth
+    # more than a filled one: we are not only entering at their price, we are
+    # risking what they risked and aiming where they aimed. `attach_protective`
+    # is normally applied to real positions, and leaving it out here meant the
+    # strongest signals carried no risk levels at all.
+    attach_protective(pool, list(orders))
 
     return detect_convergence(pool, cfg, now=now)

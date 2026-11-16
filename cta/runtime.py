@@ -45,7 +45,7 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     health = {}
     for name, venue in venues.items():
         try:
-            health[name] = bool(await venue.health())
+            health[name] = bool(await venue.health())  # type: ignore[attr-defined]
         except Exception:
             health[name] = False
     await store.set("source_health", health)
@@ -83,8 +83,12 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     # they entered it, on a fixed $100 account, so the result is measurable
     # rather than remembered. Doing it inside the cycle means no signal is ever
     # missed because a notification failed.
+    #
+    # Bookkeeping is wrapped in its own try/except and must stay that way: it is
+    # a measurement, and a measurement that can break the thing it measures is
+    # worse than no measurement. Nothing else may live inside this block.
     try:
-        from .paper import empty_account, mark_to_market, open_trade, KEY_PAPER
+        from .paper import KEY_PAPER, empty_account, mark_to_market, open_trade
 
         paper = await store.get(KEY_PAPER, None)
         if not isinstance(paper, dict):
@@ -95,10 +99,13 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
                 paper, sig.to_dict(), risk_pct=cfg.paper_risk_pct, now=_now()
             )
 
-        # Mark everything to the prices we already fetched; no extra requests.
+        # Every venue that can price a coin contributes; asking only
+        # Hyperliquid meant the paper account stopped being marked to market
+        # the moment that one venue was unavailable.
+        from .engine import market_prices
+
         try:
-            hl = venues.get("hyperliquid")
-            prices = await hl.prices() if hl is not None else {}
+            prices = await market_prices(venues)
         except Exception:
             prices = {}
         paper = mark_to_market(paper, prices or {})
@@ -106,11 +113,38 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     except Exception as exc:
         # Never let bookkeeping break the cycle, but do record it.
         print(f"[cta] paper account failed: {type(exc).__name__}: {exc}")
-        if not cfg.dry_run and tg.configured:
-            keyboard = signal_keyboard(sig.signal_id)
-            result = await tg.send(narrate_signal(sig), keyboard=keyboard)
+
+    # ── delivery ────────────────────────────────────────────────────────────
+    # This used to sit inside the paper-account `except` block. That meant a
+    # signal was sent to Telegram only when the paper account *failed*, and in
+    # the normal case — bookkeeping working perfectly — the operator received
+    # nothing at all while every counter reported the cycle as a success.
+    #
+    # Delivery is the product. It gets its own loop, outside every try/except
+    # that could swallow it, and a failed send is recorded rather than dropped.
+    if not cfg.dry_run and tg.configured:
+        for sig in signals:
+            try:
+                keyboard = signal_keyboard(sig.signal_id)
+                result = await tg.send(narrate_signal(sig), keyboard=keyboard)
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             if result.get("ok"):
                 delivered += 1
+            else:
+                try:
+                    await store.append(
+                        "delivery_failures",
+                        {
+                            "signal_id": sig.signal_id,
+                            "coin": sig.coin,
+                            "at": _now().isoformat(),
+                            "error": str(result.get("error", ""))[:200],
+                        },
+                        cap=50,
+                    )
+                except Exception:
+                    pass
 
     # The positions cache must NOT re-poll the watchlist.
     #

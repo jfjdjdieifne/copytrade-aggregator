@@ -40,6 +40,22 @@ def signal_id_for(coin: str, side: str, entry: float, opened_ms: int) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def _venue_confirms_data(venue) -> bool:
+    """Is this venue's trade history authoritative?
+
+    This used to be written as `cand.source == "hyperliquid"`, which meant every
+    other source — OKX, dYdX, GMX, and anything added later — had its scores cut
+    by 15% and was permanently barred from ELITE, no matter how good the trader.
+    A hard-coded source name is not a statement about data quality; the venue
+    knows whether its own fills are confirmed, so we ask it.
+
+    The gate still exists, because it is a real safeguard: an unverified feed
+    must not be able to manufacture an ELITE. It is now opt-out per venue
+    (`data_confirmed = False`) instead of opt-in for one.
+    """
+    return bool(getattr(venue, "data_confirmed", True))
+
+
 # ── phase 1: profiling ───────────────────────────────────────────────────────
 async def profile_watchlist(
     venues: dict,
@@ -97,7 +113,7 @@ async def profile_watchlist(
             fills,
             account_value_usd=cand.account_value,
             source=cand.source,
-            data_confirmed=cand.source == "hyperliquid",
+            data_confirmed=_venue_confirms_data(venue),
         )
         classify_trader(stats)
         scored.append(stats)
@@ -228,21 +244,47 @@ async def profile_watchlist_resumable(
         except Exception as exc:
             progress["last_error"] = f"okx leaderboard: {type(exc).__name__}: {exc}"[:160]
 
-    # (c) venues without a leaderboard contribute their seeds directly
-    for name in ("dydx", "gmx"):
-        venue = venues.get(name)
-        if venue is None:
+    # (c) every other venue that can name traders contributes them directly.
+    #
+    # This list used to be the literal string "dydx, gmx". That hard-coding is
+    # why discovery ignored any source added later: a new venue could be built,
+    # enabled, and reported healthy, and still be invisible to the search
+    # because it was not in this tuple. Discovery now asks the venues what they
+    # have instead of keeping its own list of names.
+    for name, venue in venues.items():
+        if name in ("hyperliquid", "okx"):
+            continue  # already handled above, with their own parsing
+        if not hasattr(venue, "leaderboard"):
             continue
         try:
             venue_seeds = await venue.leaderboard()
-        except Exception:
-            venue_seeds = []
-        for row in venue_seeds:
+        except BudgetExhausted:
+            raise
+        except Exception as exc:
+            progress["last_error"] = f"{name} leaderboard: {type(exc).__name__}: {exc}"[:160]
+            continue
+        for row in venue_seeds or []:
+            if not isinstance(row, dict):
+                continue
             wallet = (row.get("wallet") or "").lower()
-            if wallet:
-                candidates.append(
-                    Candidate(wallet=wallet, source=name, reasons=["seed wallet"])
+            if not wallet:
+                continue
+            # The account value MUST travel with the candidate.
+            #
+            # It used to be dropped here, so every wallet from these venues was
+            # scored with `account_value = 0`. Drawdown is measured against
+            # account value, so a 0 denominator produced an 85% "catastrophic"
+            # drawdown for *every* trader — dYdX and GMX seeds were rejected
+            # wholesale, and two of the four sources contributed nothing to the
+            # watchlist while reporting themselves healthy.
+            candidates.append(
+                Candidate(
+                    wallet=wallet,
+                    source=name,
+                    account_value=float(row.get("account_value") or 0.0),
+                    reasons=["seed wallet"],
                 )
+            )
 
     # ── 2. decide how much of it we can afford ──────────────────────────────
     total = len(candidates)
@@ -389,6 +431,38 @@ async def collect_positions(
             positions.append(p)
 
     return merge_members(dedupe_positions(positions))
+
+
+async def market_prices(venues: dict) -> dict[str, float]:
+    """A reference price for as many coins as any venue can name.
+
+    This used to ask Hyperliquid and nobody else. That is fine right up until
+    Hyperliquid is unreachable — or deliberately disabled — at which point the
+    slippage gate silently stops working, the reachability gate for resting
+    orders stops working, and `plan.py` quietly loses the market price it needs
+    to decide whether an entry is still live. The radar keeps emitting signals;
+    they are just no longer checked against reality.
+
+    Every venue that can price a coin contributes, and the first one to answer
+    wins so a slow venue cannot block the cycle. Coins only Hyperliquid lists
+    still work when it is up.
+    """
+    merged: dict[str, float] = {}
+    for _name, venue in venues.items():
+        if not hasattr(venue, "prices"):
+            continue
+        try:
+            quote = await venue.prices()
+        except Exception:
+            continue
+        for coin, px in (quote or {}).items():
+            try:
+                value = float(px)
+            except (TypeError, ValueError):
+                continue
+            if value > 0 and coin not in merged:
+                merged[coin] = value
+    return merged
 
 
 async def collect_orders(
@@ -579,13 +653,7 @@ async def scan(
         pass
 
     if prices is None:
-        prices = {}
-        hl = venues.get("hyperliquid")
-        if hl is not None:
-            try:
-                prices = await hl.prices()
-            except Exception:
-                prices = {}
+        prices = await market_prices(venues)
 
     # ── resting orders: their stops, their targets, and their intent ────────
     # One fetch serves two purposes, which is why it happens before scoring:
@@ -606,8 +674,15 @@ async def scan(
 
     pending_clusters: list = []
     if orders:
+        # The *whole* order list goes in, not just the entry orders. Passing
+        # only entries meant the traders' own stop and target orders were
+        # filtered out before the pending cluster was built, so the rarest and
+        # most actionable signal was also the only one with no risk levels on
+        # it. `detect_pending` picks the entries it needs and attaches the
+        # protective levels to them.
         pending_clusters = detect_pending(
-            net_orders([o for o in orders if o.kind == "entry"]),
+            net_orders([o for o in orders if o.kind == "entry"])
+            + [o for o in orders if o.kind in ("tp", "sl")],
             cfg,
             now=now,
             prices=prices,
@@ -683,7 +758,7 @@ async def run_cycle(
     # that stops growing at the first success is not a search, it is a sample.
     from .discovery_resume import needs_more_work as _needs_more_work
 
-    _progress = {}
+    _progress: dict = {}
     try:
         _progress = await store.get("discovery_progress", {}) or {}
     except Exception:
