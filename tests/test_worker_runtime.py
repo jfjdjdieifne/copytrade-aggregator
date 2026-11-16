@@ -258,14 +258,18 @@ async def test_dash_route_renders_live_dashboard():
     # A fresh stamp: a stale one is correctly reported as BLIND, so this test
     # would otherwise be asserting the wrong thing.
     from datetime import datetime, timezone
-    await env.STATE.set("last_cycle_at", datetime.now(timezone.utc).isoformat())
+    stamp = datetime.now(timezone.utc)
+    await env.STATE.set("last_cycle_at", stamp.isoformat())
 
     body, headers = await handle(FakeRequest("https://x.dev/dash"), env, fetch=FakeFetch({}))
 
     assert "text/html" in headers["content-type"]
     assert 'dir="rtl"' in body
     assert "0xabc" in body
-    assert "2026-11-12" in body
+    # Assert the *stored* stamp is rendered. A literal date here made this test
+    # fail on every day but one -- the dashboard prints the real clock, so the
+    # expectation has to be derived from it rather than frozen.
+    assert stamp.date().isoformat() in body
     # A reachable venue with a fresh cycle must show the watching banner.
     assert "نراقب فعلاً" in body
     assert "لا يرى المنصات" not in body
