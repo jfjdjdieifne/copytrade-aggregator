@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..models import Fill, Position
+from ..models import Fill, Order, Position
 from .base import Fetcher, RateLimited, RateLimiter, http_json
 
 
@@ -22,6 +22,25 @@ def _f(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _protective_kind(intent: str, price: float, mark: float) -> tuple[str, str]:
+    """Decide whether a protective order is a take-profit or a stop-loss.
+
+    A long is protected by a target above the market and a stop below it; a
+    short is the mirror image. `mark` is the reference price, and when it is
+    missing (or the order sits exactly on it) we refuse to choose: the order is
+    recorded as an unclassified protective level rather than being pushed into
+    a plan as a stop it may not be. A stop placed on the wrong side is the one
+    error that turns a good trade into a guaranteed loss.
+    """
+    if mark <= 0:
+        return "entry", "unknown"
+    if price > mark:
+        return ("tp", "derived") if intent == "LONG" else ("sl", "derived")
+    if price < mark:
+        return ("sl", "derived") if intent == "LONG" else ("tp", "derived")
+    return "entry", "unknown"
 
 
 def _coin_from_market(market: str) -> str:
@@ -165,6 +184,95 @@ class HyperliquidVenue:
                 )
             )
         out.sort(key=lambda f: f.time_ms)
+        return out
+
+    # ── resting orders: intent, before it becomes a fill ────────────────────
+    async def open_orders(self, wallet: str) -> list[dict]:
+        """Open orders for one wallet, with trigger/TP-SL metadata.
+
+        `frontendOpenOrders` costs ~20 weight against the same 1,200/min budget
+        as `userFills`, so it is emphatically *not* a poll-everyone call. It is
+        fetched for the wallets that already look interesting, which is why the
+        caller passes an explicit list rather than the adapter enumerating the
+        watchlist.
+
+        A refusal raises instead of returning `[]` — the same rule as `fills`.
+        An empty list here means "this wallet has no resting orders", which is a
+        legitimate and common state; "we were not allowed to ask" is not.
+        """
+        if not await self.limiter.acquire(self.cfg.hl_userfills_weight):
+            raise RateLimited(self.limiter.refusal(self.cfg.hl_userfills_weight))
+        data = await http_json(
+            self.fetch,
+            f"{self.cfg.hl_base_url}/info",
+            method="POST",
+            payload={"type": "frontendOpenOrders", "user": wallet},
+        )
+        return data if isinstance(data, list) else []
+
+    @staticmethod
+    def parse_open_orders(
+        wallet: str, rows: list[dict], prices: Optional[dict] = None
+    ) -> list[Order]:
+        """Raw `frontendOpenOrders` rows -> Order objects, side and kind derived.
+
+        Nothing here trusts a label that can lie:
+
+        * `side` (B/A) is the *order's* side, not the position it creates. A
+          resting bid that is not reduce-only intends to be long; a reduce-only
+          ask can only be closing a long. So the intended position side is
+          derived from `side` combined with `reduceOnly`, never from `side` alone.
+        * `isPositionTpsl` / `reduceOnly` + `isTrigger` mark a protective order,
+          but they do not say whether it is the stop or the target. That is
+          resolved against the live mark price: a long's target sits above the
+          market and its stop below. When no reference price is available the
+          order is left as an `entry` rather than being guessed into a `tp`.
+        """
+        prices = prices or {}
+        out: list[Order] = []
+        for r in rows:
+            coin = _coin_from_market(r.get("coin", ""))
+            mark = _f(prices.get(coin))
+            limit_px = _f(r.get("limitPx"))
+            trigger_px = _f(r.get("triggerPx"))
+            is_trigger = bool(r.get("isTrigger"))
+            reduce_only = bool(r.get("reduceOnly"))
+            side_str = str(r.get("side") or "").upper()
+            is_buy = side_str == "B"
+            price = trigger_px if (is_trigger and trigger_px > 0) else limit_px
+            if price <= 0:
+                continue
+
+            # Intended position side: opening bids go long, opening asks go
+            # short; a reduce-only order closes the opposite side.
+            intent = "LONG" if is_buy else "SHORT"
+            if reduce_only:
+                intent = "SHORT" if is_buy else "LONG"
+
+            protective = bool(r.get("isPositionTpsl")) or (reduce_only and is_trigger)
+            kind = "entry"
+            confidence = "reported"
+            if protective:
+                kind, confidence = _protective_kind(intent, price, mark)
+
+            out.append(
+                Order(
+                    wallet=wallet.lower(),
+                    source="hyperliquid",
+                    coin=coin,
+                    side=intent,
+                    kind=kind,
+                    price=price,
+                    size=abs(_f(r.get("sz")) or _f(r.get("origSz"))),
+                    order_id=str(r.get("oid") or ""),
+                    size_usd=abs(price * (_f(r.get("sz")) or _f(r.get("origSz")))),
+                    reduce_only=reduce_only,
+                    trigger_px=trigger_px or None,
+                    placed_ms=int(_f(r.get("timestamp"))),
+                    kind_confidence=confidence,
+                    raw=r,
+                )
+            )
         return out
 
     # ── prices ──────────────────────────────────────────────────────────────

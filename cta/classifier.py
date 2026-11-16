@@ -118,6 +118,11 @@ def stats_from_fills(
     explicit `classify_trader` step silently got un-graded traders, and every
     convergence check downstream then failed for the wrong reason.
     """
+    # A venue that withholds fees (OKX's public history reports `pnl` with no
+    # fee column) makes every number below gross. We do not invent a fee and we
+    # do not pretend the gap is zero — we carry the flag and the grade says it.
+    fee_unknown = any(bool(f.raw.get("fee_unknown")) for f in fills)
+
     closed = [f for f in fills if f.closed_pnl != 0.0]
     n = len(closed)
     if n == 0:
@@ -166,6 +171,7 @@ def stats_from_fills(
         account_value_usd=account_value_usd,
         source=source,
         data_confirmed=data_confirmed,
+        fee_unknown=fee_unknown,
     )
     if grade:
         classify_trader(stats)
@@ -279,6 +285,14 @@ def classify_trader(stats: TraderStats, thresholds: Thresholds = T) -> tuple[str
     if not stats.data_confirmed:
         score *= 0.85
         reasons.append("بيانات غير مؤكدة (−15%)")
+
+    # Gross-of-fee numbers flatter the trader. The multiplier is an explicit,
+    # visible haircut rather than a hidden adjustment, and it keeps a
+    # fee-blind feed from producing an ELITE on numbers that would not survive
+    # contact with a real commission schedule.
+    if stats.fee_unknown:
+        score *= 0.92
+        reasons.append("الرسوم غير منشورة من المنصة (−8%)")
 
     stats.score = int(round(max(0.0, min(100.0, score))))
 

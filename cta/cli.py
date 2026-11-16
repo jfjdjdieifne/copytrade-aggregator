@@ -114,7 +114,7 @@ class _Resp:
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
-async def cmd_doctor(env: LocalEnv) -> int:
+async def cmd_doctor(env: LocalEnv, deep: bool = False, wallets: Optional[dict] = None) -> int:
     from .bootstrap import config_summary, missing_env
     from .sources import build_venues
 
@@ -142,6 +142,17 @@ async def cmd_doctor(env: LocalEnv) -> int:
         ok += int(healthy)
 
     print(f"\n{ok}/{len(venues)} منصة تستجيب")
+
+    if deep:
+        # A liveness probe only asks "can I reach you". Every real bug in this
+        # project answered "yes" to that and still returned nothing usable.
+        from .doctor import probe_all, render
+
+        print("\n── فحص عميق (بيانات حقيقية لمحفظة معروفة) ──")
+        report = await probe_all(venues, wallets or {})
+        print(render(report))
+        return 0 if not report["broken"] else 2
+
     return 0 if ok else 2
 
 
@@ -201,7 +212,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="cta", description="Copy-Trade Aggregator v2")
     sub = parser.add_subparsers(dest="cmd")
 
-    sub.add_parser("doctor", help="فحص الإعداد والاتصال")
+    doctor_p = sub.add_parser("doctor", help="فحص الإعداد والاتصال")
+    doctor_p.add_argument("--deep", action="store_true",
+                          help="يسأل كل منصة عن بيانات حقيقية لمحفظة معروفة")
+    doctor_p.add_argument("--wallet", action="append", default=[],
+                          metavar="المنصة=المحفظة",
+                          help="مثال: --wallet hyperliquid=0xabc --wallet dydx=dydx1...")
     sub.add_parser("profile", help="بناء قائمة المراقبة")
     sub.add_parser("scan", help="دورة مراقبة واحدة")
     sub.add_parser("track", help="تقييم الإشارات المخزنة")

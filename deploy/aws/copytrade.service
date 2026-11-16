@@ -1,0 +1,22 @@
+[Unit]
+Description=Copy-Trade Aggregator — consensus radar for proven traders
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__REPO_DIR__
+EnvironmentFile=__REPO_DIR__/.env
+ExecStart=__PYTHON__ -m cta.cli run --interval __INTERVAL__
+Restart=always
+RestartSec=10
+# A crash loop must not hammer the venues or burn the budget: systemd will give
+# up restarting after 5 failures in 5 minutes and leave the last error visible.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

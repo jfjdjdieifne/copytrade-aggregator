@@ -59,8 +59,25 @@ class Config:
     hl_base_url: str = "https://api.hyperliquid.xyz"
     hl_stats_url: str = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
     dydx_base_url: str = "https://indexer.dydx.trade/v4"
-    gmx_base_url: str = "https://arbitrum.gmxapi.io/v1"
-    enabled_sources: tuple[str, ...] = ("hyperliquid", "dydx", "gmx")
+    # The previous default (`arbitrum.gmxapi.io/v1`) is not a GMX host. Every
+    # request to it failed, and because the adapter swallowed the exception the
+    # venue was reported healthy with an empty position list. GMX's documented
+    # hosts are `{chain}-api.gmxinfra.io`.
+    gmx_base_url: str = "https://arbitrum-api.gmxinfra.io"
+    enabled_sources: tuple[str, ...] = ("hyperliquid", "okx", "dydx", "gmx")
+
+    # ── OKX copy trading (keyless, documented, ranked) ──────────────────────
+    # The only free venue that hands us a *curated* list of lead traders plus a
+    # closed-position history per trader, in a handful of light requests. That
+    # is what makes discovery possible without downloading 39 MB.
+    okx_base_url: str = "https://www.okx.com"
+    okx_sort_type: str = "pnl_ratio"        # pnl_ratio | win_ratio | aum | pnl
+    okx_min_lead_days: str = "3"            # '1' 7d · '2' 30d · '3' 90d · '4' 180d
+    okx_max_pages: int = 8                  # 20 traders per page
+    okx_max_traders: int = 300
+    # Conservative: OKX weights copy-trading reads at 4 against a shared public
+    # budget, and a refusal must never be mistaken for "this trader is empty".
+    okx_weight_budget_per_min: int = 240
     # dYdX and GMX expose no follower leaderboard, so they need seed wallets.
     # A single high-quality seed on a *second* venue raises signal independence
     # more than ten extra wallets on Hyperliquid.
@@ -127,6 +144,15 @@ class Config:
     min_signal_score: int = 65
     signal_ttl_min: int = 240
     risk_per_trade_pct: float = 1.0
+
+    # ── resting orders (pending consensus) ─────────────────────────────────
+    # Reading orders is the only way to enter at the traders' own price, and it
+    # is by far the most expensive call we make: ~20 weight per wallet on
+    # Hyperliquid against the same budget as fills. The sweep is bounded and
+    # rotates so cost stays flat as the watchlist grows.
+    orders_enabled: bool = True
+    orders_max_wallets: int = 40          # wallets whose orders we read per tick
+    orders_max_age_min: float = 1440.0    # an order older than this is litter
 
     # ── ai ──────────────────────────────────────────────────────────────────
     ai_enabled: bool = True

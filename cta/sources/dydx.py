@@ -97,17 +97,42 @@ class DydxVenue:
 
     # ── fills ───────────────────────────────────────────────────────────────
     async def fills(self, wallet: str, limit: int = 2000) -> list[dict]:
+        """Fills for one subaccount.
+
+        The indexer requires `address` *and* `subaccountNumber`. This used to
+        request the global `/v4/fills` feed and then filter locally, which sounds
+        equivalent but is not: that endpoint returns the most recent fills across
+        the whole venue, so for any wallet that had not traded in the last few
+        seconds the result was empty. The radar then recorded "no fills" for
+        traders who had thousands of them.
+
+        Worse, the filter compared `r["subaccount"]["address"]`, a field the
+        response does not contain for a subaccount-scoped query, so even a
+        wallet that *was* in the feed was filtered out. The adapter returned `[]`
+        for essentially every wallet and the venue still reported healthy.
+        """
         if not await self.limiter.acquire(1):
             return []
         data = await http_json(
             self.fetch,
-            f"{self.cfg.dydx_base_url}/fills",
+            f"{self.cfg.dydx_base_url}/fills{self._qs(wallet, limit)}",
             method="GET",
             headers={"X-Requested-With": "cta-radar"},
         )
         rows = data.get("fills", []) if isinstance(data, dict) else []
-        mine = [r for r in rows if str(r.get("subaccount") or r.get("address") or "").lower() == wallet.lower()]
-        return (mine or rows)[:limit]
+        return rows[:limit]
+
+    @staticmethod
+    def _qs(wallet: str, limit: Optional[int] = None) -> str:
+        """Build the `?address=&subaccountNumber=` query the indexer expects.
+
+        dYdX addresses are bech32 (`dydx1...`), case-sensitive by convention but
+        accepted lower-cased, so we do not fold the case of the path.
+        """
+        parts = [f"address={wallet}", "subaccountNumber=0"]
+        if limit:
+            parts.append(f"limit={max(1, min(1000, int(limit)))}")
+        return "?" + "&".join(parts)
 
     @staticmethod
     def parse_fills(rows: list[dict]) -> list[Fill]:
@@ -135,16 +160,44 @@ class DydxVenue:
 
     # ── positions ───────────────────────────────────────────────────────────
     async def positions(self, wallet: str) -> list[dict]:
+        """Open perpetual positions for one subaccount.
+
+        Same defect as `fills`, same consequence: the unparameterised call
+        returned a page of *someone else's* positions, then the local filter
+        matched nothing and fell through to `rows`, so the radar attributed
+        arbitrary strangers' positions to the wallet it was watching.
+        """
         if not await self.limiter.acquire(1):
             return []
         data = await http_json(
             self.fetch,
-            f"{self.cfg.dydx_base_url}/perpetualPositions",
+            f"{self.cfg.dydx_base_url}/perpetualPositions{self._qs(wallet)}",
             method="GET",
             headers={"X-Requested-With": "cta-radar"},
         )
         rows = data.get("positions", []) if isinstance(data, dict) else []
-        return [r for r in rows if str(r.get("subaccount") or "").lower() == wallet.lower()] or rows
+        return [r for r in rows if str(r.get("status", "OPEN")).upper() == "OPEN"]
+
+    # ── resting orders: the trader's intent, before it becomes a fill ───────
+    async def open_orders(self, wallet: str) -> list[dict]:
+        """Open orders for one subaccount.
+
+        This is where dYdX is genuinely more informative than a centralised
+        copy-trading board: `TAKE_PROFIT` and `STOP_MARKET` orders carry an
+        explicit `triggerPrice`, so the trader's stop and target are published
+        before the trade is over — the one piece of information that makes
+        copying at *their* price possible instead of chasing it.
+        """
+        if not await self.limiter.acquire(1):
+            return []
+        data = await http_json(
+            self.fetch,
+            f"{self.cfg.dydx_base_url}/orders{self._qs(wallet, 200)}",
+            method="GET",
+            headers={"X-Requested-With": "cta-radar"},
+        )
+        rows = data.get("orders", []) if isinstance(data, dict) else []
+        return [r for r in rows if str(r.get("status", "")).upper() in ("OPEN", "UNTRIGGERED")]
 
     @staticmethod
     def parse_positions(wallet: str, rows: list[dict]) -> list[Position]:

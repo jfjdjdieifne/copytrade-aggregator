@@ -49,8 +49,27 @@ WORKER_URL = "https://copytrade-aggregator.<your-subdomain>.workers.dev"
 HL_BASE_URL = "https://api.hyperliquid.xyz"
 HL_STATS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 DYDX_BASE_URL = "https://indexer.dydx.trade/v4"
-GMX_BASE_URL = "https://arbitrum.gmxapi.io/v1"
-ENABLED_SOURCES = "hyperliquid,dydx,gmx"
+# NOT gmxapi.io — that host was never a GMX endpoint; every request to it
+# failed and the adapter reported the venue as healthy anyway.
+GMX_BASE_URL = "https://arbitrum-api.gmxinfra.io"
+
+# OKX copy trading — keyless, ranked lead-trader board + closed-position history.
+# This is the only free leaderboard small enough to parse inside the plan's
+# 10 ms CPU budget, so it is the one that actually works here.
+OKX_BASE_URL = "https://www.okx.com"
+OKX_SORT_TYPE = "pnl_ratio"
+OKX_MIN_LEAD_DAYS = "3"
+OKX_MAX_PAGES = "4"
+OKX_MAX_TRADERS = "120"
+
+ENABLED_SOURCES = "hyperliquid,okx,dydx,gmx"
+
+# Reading resting orders costs ~20 weight per wallet on Hyperliquid (vs 2 for a
+# position poll), so the sweep stays small on the Worker. Raise it freely on a
+# server, where there is no 50-subrequest ceiling.
+ORDERS_ENABLED = "true"
+ORDERS_MAX_WALLETS = "12"
+ORDERS_MAX_AGE_MIN = "1440"
 
 # seed wallets for venues with no follower leaderboard (dYdX / GMX)
 # comma-separated addresses, e.g. "dydx1abc...,dydx1def..."

@@ -20,7 +20,9 @@ from .confidence import score_cluster
 from .config import Config
 from .convergence import detect_convergence
 from .discovery import build_watchlist, select_candidates
-from .models import Cluster, Position, Signal, TraderStats
+from .models import Cluster, Order, Position, Signal, TraderStats
+from .orders import attach_protective, net_orders
+from .pending import detect_pending
 from .plan import build_plan
 from .state import KEY_PROFILES, KEY_WATCHLIST, Store, get_watchlist
 
@@ -208,6 +210,24 @@ async def profile_watchlist_resumable(
     except Exception:
         pass
 
+    # (b2) OKX: a ranked, server-side-filtered board of lead traders. Unlike
+    # Hyperliquid's 39 MB dump this arrives in a handful of small pages, so it
+    # is the one leaderboard that reliably works inside a tight budget. Its rows
+    # carry no window PnL, so discovery treats them as "no window data" and
+    # accepts them on account value — the real verdict comes from the closed
+    # subposition history, which is the number we actually trust.
+    okx = venues.get("okx")
+    if okx is not None:
+        try:
+            okx_rows = await okx.leaderboard()
+            progress["okx_rows"] = len(okx_rows or [])
+            parsed = [okx.parse_leaderboard_row(r) for r in okx_rows or []]
+            candidates += select_candidates(parsed, cfg, "okx")
+        except BudgetExhausted:
+            raise
+        except Exception as exc:
+            progress["last_error"] = f"okx leaderboard: {type(exc).__name__}: {exc}"[:160]
+
     # (c) venues without a leaderboard contribute their seeds directly
     for name in ("dydx", "gmx"):
         venue = venues.get(name)
@@ -371,6 +391,58 @@ async def collect_positions(
     return merge_members(dedupe_positions(positions))
 
 
+async def collect_orders(
+    venues: dict,
+    watchlist: Sequence[dict],
+    cfg: Optional[Config] = None,
+    limit: Optional[int] = None,
+    prices: Optional[dict[str, float]] = None,
+) -> list[Order]:
+    """Fetch resting orders for a rotating window of watched wallets.
+
+    Two things make this the most expensive call in the system:
+
+    * Hyperliquid charges `frontendOpenOrders` the same ~20 weight as `userFills`
+      — ten times the cost of polling a position.
+    * Only some venues publish orders at all. OKX's public copy-trading
+      endpoints expose no resting orders whatsoever, and pretending otherwise
+      would be the same silent-zero bug this project keeps paying for.
+
+    So the sweep is bounded (`orders_max_wallets`) and rotates independently of
+    the position sweep, so every wallet's orders are still seen regularly
+    without spending the whole budget on them in one tick.
+    """
+    cfg = cfg or Config()
+    if not getattr(cfg, "orders_enabled", True):
+        return []
+    limit = limit or int(getattr(cfg, "orders_max_wallets", 40))
+
+    quality_by_wallet = {
+        w["wallet"]: (w.get("grade", "WATCH"), w.get("score", 0)) for w in watchlist
+    }
+    out: list[Order] = []
+    for entry in watchlist[:limit]:
+        wallet = entry.get("wallet")
+        source = entry.get("source", "hyperliquid")
+        venue = venues.get(source)
+        if venue is None or not wallet:
+            continue
+        # A venue with no order endpoint is skipped, not simulated.
+        if not hasattr(venue, "open_orders") or not hasattr(venue, "parse_open_orders"):
+            continue
+        try:
+            raw = await venue.open_orders(wallet)
+        except Exception:
+            continue
+        parsed = venue.parse_open_orders(wallet, raw, prices=prices)
+        grade, score = quality_by_wallet.get(wallet, ("WATCH", 0))
+        for o in parsed:
+            o.quality = grade
+            o.quality_score = int(score)
+            out.append(o)
+    return out
+
+
 def cost_of_position(cfg: Config) -> int:
     """Worst-case subrequests for one wallet's positions call.
 
@@ -387,6 +459,7 @@ def build_signal(
     market_price: Optional[float] = None,
     atr_hint: Optional[float] = None,
     now: Optional[datetime] = None,
+    kind: str = "filled",
 ) -> Optional[Signal]:
     """Turn a passing cluster into a fully explainable Signal (or None)."""
     cfg = cfg or Config()
@@ -432,6 +505,7 @@ def build_signal(
         members=members,
         created_at=now,
         signal_id=signal_id_for(cluster.coin, cluster.side, cluster.entry_center, opened_ms),
+        kind=kind,
         market_price=market_price,
         breakdown=conf.breakdown,
         reasons=conf.reasons,
@@ -513,14 +587,52 @@ async def scan(
             except Exception:
                 prices = {}
 
-    clusters = detect_convergence(positions, cfg, now=now)
+    # ── resting orders: their stops, their targets, and their intent ────────
+    # One fetch serves two purposes, which is why it happens before scoring:
+    #   1. a trader's own TP/SL levels are attached to their position, so the
+    #      plan quotes *their* stop instead of one we computed from ATR;
+    #   2. resting entry orders are clustered separately — those are trades we
+    #      can still enter at the traders' price instead of chasing them.
+    orders: list[Order] = []
+    if getattr(cfg, "orders_enabled", True):
+        order_window = max(
+            1, min(len(watchlist), int(getattr(cfg, "orders_max_wallets", 40)))
+        )
+        orders = await collect_orders(venues, batch, cfg, limit=order_window, prices=prices)
+        if orders:
+            attach_protective(positions, orders)
+
+    filled_clusters = detect_convergence(positions, cfg, now=now)
+
+    pending_clusters: list = []
+    if orders:
+        pending_clusters = detect_pending(
+            net_orders([o for o in orders if o.kind == "entry"]),
+            cfg,
+            now=now,
+            prices=prices,
+            max_age_min=getattr(cfg, "orders_max_age_min", 1440.0),
+        )
+
+    # Pending consensus is rarer and more actionable than filled consensus: the
+    # entry is still reachable. It is reported first for exactly that reason.
+    clusters = list(pending_clusters) + [
+        c for c in filled_clusters
+        if (c.coin, c.side) not in {(p.coin, p.side) for p in pending_clusters}
+    ]
+    pending_keys = {(c.coin, c.side, round(c.entry_center, 6)) for c in pending_clusters}
 
     seen = set(await store.get("seen_signal_ids", []) or [])
     emitted: list[Signal] = []
     rejected: list[dict] = []
     for cluster in clusters:
         price = prices.get(cluster.coin)
-        sig = build_signal(cluster, cfg, market_price=price, now=now)
+        kind = (
+            "pending"
+            if (cluster.coin, cluster.side, round(cluster.entry_center, 6)) in pending_keys
+            else "filled"
+        )
+        sig = build_signal(cluster, cfg, market_price=price, now=now, kind=kind)
         if sig is None:
             # Record *why* a cluster died. "No signal" with no explanation is the
             # single least trustworthy thing a monitoring system can report.

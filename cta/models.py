@@ -51,6 +51,11 @@ class TraderStats:
     account_value_usd: float = 0.0
     source: str = "hyperliquid"
     data_confirmed: bool = False
+    # True when the venue never reported fees (OKX's public history does not),
+    # which makes every profitability figure below *gross* and therefore
+    # optimistic. Kept on the record so the grade can say so instead of
+    # quietly treating an optimistic number as a net one.
+    fee_unknown: bool = False
     score: int = 0
     grade: str = "REJECT"
     reasons: list[str] = field(default_factory=list)
@@ -95,6 +100,77 @@ class Position:
             return 0.0
         now = now or datetime.now(UTC)
         return max(0.0, (now - self.opened_at).total_seconds() / 60.0)
+
+
+@dataclass(slots=True)
+class Order:
+    """A resting order — the only place a trader's *intent* is visible.
+
+    A fill tells you what already happened and it is already too late to copy at
+    that price. A resting order tells you where the trader is willing to enter
+    and, on the venues that expose them, exactly where they put their stop and
+    their target. That is the whole edge of watching orders instead of fills, so
+    this model is deliberately explicit about what we derived and what the venue
+    actually said.
+    """
+
+    wallet: str
+    source: str
+    coin: str
+    side: str                  # LONG | SHORT — the position the order intends
+    kind: str                  # entry | tp | sl
+    price: float               # the price we would trade at
+    size: float
+    order_id: str = ""
+    size_usd: float = 0.0
+    reduce_only: bool = False
+    trigger_px: Optional[float] = None     # for conditional orders, as reported
+    placed_ms: int = 0
+    kind_confidence: str = "reported"      # reported | derived
+    quality: str = "WATCH"
+    quality_score: int = 0
+    raw: dict = field(default_factory=dict)
+
+    @property
+    def notional_usd(self) -> float:
+        if self.size_usd:
+            return abs(self.size_usd)
+        return abs(self.price * self.size)
+
+    @property
+    def is_entry(self) -> bool:
+        return self.kind == "entry"
+
+    def placed_at(self) -> Optional[datetime]:
+        if not self.placed_ms:
+            return None
+        return datetime.fromtimestamp(self.placed_ms / 1000.0, tz=UTC)
+
+    def age_minutes(self, now: Optional[datetime] = None) -> float:
+        placed = self.placed_at()
+        if placed is None:
+            return 0.0
+        now = now or datetime.now(UTC)
+        return max(0.0, (now - placed).total_seconds() / 60.0)
+
+    def to_dict(self) -> dict:
+        return {
+            "wallet": self.wallet,
+            "source": self.source,
+            "coin": self.coin,
+            "side": self.side,
+            "kind": self.kind,
+            "price": round(self.price, 8),
+            "size": round(self.size, 8),
+            "size_usd": round(self.size_usd, 2),
+            "order_id": self.order_id,
+            "reduce_only": self.reduce_only,
+            "trigger_px": self.trigger_px,
+            "placed_ms": self.placed_ms,
+            "kind_confidence": self.kind_confidence,
+            "quality": self.quality,
+            "quality_score": self.quality_score,
+        }
 
 
 # ── outputs ──────────────────────────────────────────────────────────────────
@@ -169,6 +245,13 @@ class Signal:
     members: list[dict]
     created_at: datetime
     signal_id: str = ""
+    # "pending" — built from resting orders that have not filled: the entry is
+    # still reachable at the traders' own price.
+    # "filled"  — built from positions the traders already hold: we are arriving
+    #              after them and the slippage gate decides whether that is OK.
+    # The two are not the same claim and the operator must be able to tell them
+    # apart at a glance, so it travels with the signal everywhere it goes.
+    kind: str = "filled"
     market_price: Optional[float] = None
     breakdown: dict[str, int] = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
@@ -182,6 +265,7 @@ class Signal:
     def to_dict(self) -> dict:
         return {
             "signal_id": self.signal_id,
+            "kind": self.kind,
             "coin": self.coin,
             "side": self.side,
             "score": self.score,

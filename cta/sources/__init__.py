@@ -8,6 +8,7 @@ from .base import Fetcher, HttpError, RateLimiter, http_json
 from .dydx import DydxVenue
 from .gmx import GmxVenue
 from .hyperliquid import HyperliquidVenue
+from .okx import OKXVenue
 
 __all__ = [
     "Fetcher",
@@ -15,6 +16,7 @@ __all__ = [
     "RateLimiter",
     "http_json",
     "HyperliquidVenue",
+    "OKXVenue",
     "DydxVenue",
     "GmxVenue",
     "build_venues",
@@ -26,6 +28,8 @@ def build_venues(fetch: Fetcher, cfg) -> Dict[str, object]:
     venues: Dict[str, object] = {}
     if cfg.source_enabled("hyperliquid"):
         venues["hyperliquid"] = HyperliquidVenue(fetch, cfg)
+    if cfg.source_enabled("okx"):
+        venues["okx"] = OKXVenue(fetch, cfg)
     if cfg.source_enabled("dydx"):
         venues["dydx"] = DydxVenue(fetch, cfg)
     if cfg.source_enabled("gmx"):
