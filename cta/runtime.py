@@ -121,6 +121,7 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     report = await run_cycle(venues, store, cfg, now=_now())
 
     signals = report.pop("signal_objects", []) or []
+    clusters = report.pop("cluster_objects", []) or []
     tg = Telegram(fetch, getattr(env, "TELEGRAM_BOT_TOKEN", ""), getattr(env, "TELEGRAM_CHAT_ID", ""))
 
     delivered = 0
@@ -219,6 +220,28 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
         # it breaks, the raw signal must still reach the operator.
         print(f"[cta] lifecycle failed: {type(exc).__name__}: {exc}")
 
+    # ── the A/B lab ─────────────────────────────────────────────────────────
+    # How many traders does an agreement need? Answered by running several
+    # thresholds side by side on the same clusters and the same prices, so any
+    # difference in outcome is the threshold's doing.
+    try:
+        from .shadow import KEY_SHADOW, empty_lab, mark_all, observe_clusters
+
+        lab = await store.get(KEY_SHADOW, None)
+        if not isinstance(lab, dict):
+            lab = empty_lab(
+                start_balance=cfg.paper_start_balance,
+                risk_pct=cfg.paper_risk_pct,
+            )
+        lab = observe_clusters(
+            lab, clusters, cfg, prices, _now(),
+            n_positions=len(positions),
+            n_coins=len({str(getattr(p, 'coin', '') or '') for p in positions}),
+        )
+        lab = mark_all(lab, prices)
+        await store.set(KEY_SHADOW, lab)
+    except Exception as exc:
+        print(f"[cta] shadow lab failed: {type(exc).__name__}: {exc}")
     # ── delivery ────────────────────────────────────────────────────────────
     # This used to sit inside the paper-account `except` block. That meant a
     # signal was sent to Telegram only when the paper account *failed*, and in

@@ -279,6 +279,29 @@ async def cmd_chat(env: LocalEnv, question: str) -> int:
     return 0
 
 
+async def cmd_lab(env: LocalEnv) -> int:
+    """The A/B lab: how many traders does an agreement actually need?
+
+    Prints the distribution of agreement sizes the radar has actually seen --
+    the honest answer to "is three traders common or a once-a-year event?" --
+    next to the paper result of each threshold, running from the same clusters
+    and the same prices.
+    """
+    from .paper import KEY_PAPER, summarize
+    from .shadow import KEY_SHADOW, empty_lab, render_lab
+
+    store = store_from_env(env)
+    lab = await store.get(KEY_SHADOW, None)
+    if not isinstance(lab, dict):
+        lab = empty_lab()
+
+    pro = await store.get(KEY_PAPER, None)
+    pro_summary = summarize(pro) if isinstance(pro, dict) else None
+
+    print(render_lab(lab, pro_summary))
+    return 0
+
+
 async def cmd_funnel(env: LocalEnv) -> int:
     """Open the funnel: who nearly agreed, and which gate stopped them.
 
@@ -401,6 +424,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     run_p.add_argument("--interval", type=int, default=60)
 
     sub.add_parser("funnel", help="ليش ما في إشارات؟ — أقرب الإجماعات والبوابة اللي وقفتها")
+    sub.add_parser("lab", help="مختبر الاتفاق: كم متداول لازم؟ مقارنة ≥2/≥3/≥4/≥5 بالورق")
 
     chat_p = sub.add_parser("chat", help="سؤال للمساعد")
     chat_p.add_argument("question", nargs="+")
@@ -434,6 +458,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return asyncio.run(cmd_run(env, args.interval))
     if command == "funnel":
         return asyncio.run(cmd_funnel(env))
+    if command == "lab":
+        return asyncio.run(cmd_lab(env))
     if command == "chat":
         return asyncio.run(cmd_chat(env, " ".join(args.question)))
 

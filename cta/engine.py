@@ -825,6 +825,10 @@ async def run_cycle(
         "profiled": profiled,
         "watchlist_size": len(watchlist),
         "clusters": len(clusters),
+        # The raw clusters, not just how many. The A/B lab measures the
+        # *distribution* of agreement sizes -- is three traders common or a
+        # once-a-year event? -- and that needs the objects, not the count.
+        "cluster_objects": clusters,
         "signals": len(signals),
         "signal_objects": signals,
     }
