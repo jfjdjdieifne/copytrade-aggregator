@@ -215,6 +215,71 @@ async def cmd_chat(env: LocalEnv, question: str) -> int:
     return 0
 
 
+async def cmd_funnel(env: LocalEnv) -> int:
+    """Open the funnel: who nearly agreed, and which gate stopped them.
+
+    This is the command to run when the radar is quiet and you cannot tell
+    whether that is patience or a misconfiguration. Silence that means "the
+    market is calm" and silence that means "this will never fire" look exactly
+    alike until you measure the near misses.
+    """
+    from .config import Config
+    from .engine import collect_positions
+    from .funnel import diagnose
+    from .sources import build_venues
+    from .state import get_watchlist, store_from_env
+
+    cfg = Config.from_env(env)
+    store = store_from_env(env)
+    venues = build_venues(_stdlib_fetch, cfg)
+
+    health = {}
+    for name, venue in venues.items():
+        try:
+            health[name] = bool(await venue.health())
+        except Exception:
+            health[name] = False
+
+    watchlist = await get_watchlist(store)
+    limit = min(cfg.watchlist_max, max(len(watchlist), 25))
+    positions = await collect_positions(venues, watchlist, cfg, limit=limit)
+    report = diagnose(positions, watchlist, cfg)
+
+    print("── المنصات ──")
+    for name, ok in health.items():
+        print(f"  {name}: {'🟢' if ok else '🔴'}")
+
+    print()
+    print("── القمع ──")
+    print(f"  قائمة المراقبة : {report['watchlist']}")
+    print(f"  مراكز مرئية    : {report['positions_seen']}")
+    print(f"  محافظ بمركز    : {report['wallets_holding']}")
+    print(f"  عملات مرئية    : {', '.join(report['coins_seen']) or '—'}")
+
+    print()
+    print("── العتبات ──")
+    for key, value in report["thresholds"].items():
+        print(f"  {key:22} {value}")
+
+    print()
+    print("── أقرب الإجماعات ──")
+    if not report["near_misses"]:
+        print("  ما في ولا مجموعة متداولين على نفس العملة والاتجاه.")
+    for m in report["near_misses"]:
+        flag = "✅ جاهز" if m["passed"] else "❌"
+        print(
+            f"  {flag} {m['coin']} {m['side']}: {m['n_independent']} متداول "
+            f"({m['n_sources']} مصدر) · انتشار {m['spread_bps']}bps · "
+            f"تباعد {m['span_min']}د · عمر {m['age_min']}د"
+        )
+        for gate in m["failed_gates"]:
+            print(f"        ↳ {gate}")
+
+    print()
+    print(f"📋 {report['verdict']}")
+    return 0
+
+
 async def cmd_simulate(cycles: int = 12, traders: int = 40, seed: int = 7,
                        quiet: bool = False) -> int:
     """Run the real pipeline against the simulator.
@@ -271,6 +336,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     run_p = sub.add_parser("run", help="حلقة مستمرة")
     run_p.add_argument("--interval", type=int, default=60)
 
+    sub.add_parser("funnel", help="ليش ما في إشارات؟ — أقرب الإجماعات والبوابة اللي وقفتها")
+
     chat_p = sub.add_parser("chat", help="سؤال للمساعد")
     chat_p.add_argument("question", nargs="+")
 
@@ -301,6 +368,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return asyncio.run(cmd_track(env))
     if command == "run":
         return asyncio.run(cmd_run(env, args.interval))
+    if command == "funnel":
+        return asyncio.run(cmd_funnel(env))
     if command == "chat":
         return asyncio.run(cmd_chat(env, " ".join(args.question)))
 
