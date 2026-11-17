@@ -298,7 +298,7 @@ class SimVenue:
         max_age = timedelta(hours=self.max_position_age_h)
         for wallet, book in list(self._positions.items()):
             kept: list[Position] = []
-            for p in book:
+            for p in book:  # noqa: B007
                 px = self.market.price(p.coin)
                 hit = False
                 if p.signed_size >= 0:
@@ -323,11 +323,11 @@ class SimVenue:
                 self._positions.pop(wallet, None)
         # Resting orders expire too: an order left open forever is a lie about
         # intent, and it would keep generating "pending" consensus forever.
-        for wallet, book in list(self._orders.items()):
-            kept_orders = [
-                o for o in book
-                if not (o.placed_ms and
-                        (self.now_ms() - o.placed_ms) > self.max_order_age_ms)
+        for wallet, order_book in list(self._orders.items()):
+            kept_orders: list[Order] = [
+                resting for resting in order_book
+                if not (resting.placed_ms and
+                        (self.now_ms() - resting.placed_ms) > self.max_order_age_ms)
             ]
             if kept_orders:
                 self._orders[wallet] = kept_orders
