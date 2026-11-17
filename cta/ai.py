@@ -278,3 +278,118 @@ async def ask_ai(
     if budget is not None:
         budget.charge(len(prompt), out_tokens=max(1, len(text) // 3))
     return text
+
+
+# ── the trade lifecycle: entry, confirmation, exit ───────────────────────────
+_AR_EXIT_REASON = {
+    "members_left": "المحترفون خرجوا",
+    "expired": "انتهى عمر الصفقة",
+}
+
+
+def narrate_idea_open(idea, signal=None) -> str:
+    """The entry message. One per idea, not one per cluster."""
+    side = _AR_SIDE.get(idea.side, idea.side)
+    arrow = _AR_ARROW.get(idea.side, "•")
+
+    out = [
+        f"{arrow} *صفقة جديدة: {idea.coin} — {side}*",
+        "",
+        f"• متداولون مستقلون: *{len(idea.members)}*",
+        f"• المصادر: {', '.join(sorted(idea.sources))}",
+    ]
+    if signal is not None:
+        level = _AR_LEVEL.get(signal.level, signal.level)
+        out.insert(1, f"قوة الإجماع: {level} ({signal.score}/100)")
+
+    out += [
+        "",
+        f"• الدخول: `{_g(idea.entry)}`",
+        f"• الستوب: `{_g(idea.stop)}`",
+        f"• الهدف: `{_g(idea.target)}`",
+    ]
+    if idea.entry and idea.stop and idea.target:
+        risk = abs(idea.entry - idea.stop)
+        reward = abs(idea.target - idea.entry)
+        if risk > 0:
+            out.append(f"• العائد/المخاطرة: {reward / risk:.1f}:1")
+
+    out += [
+        "",
+        "سأتابع هالمتداولين وأقولك متى يخرجون.",
+        "",
+        "⚠️ قرار شخصي — ليست نصيحة مالية · HYPOTHETICAL_",
+    ]
+    return "\n".join(out)
+
+
+def narrate_idea_strengthen(idea, joined: int) -> str:
+    side = _AR_SIDE.get(idea.side, idea.side)
+    return "\n".join([
+        f"📈 *{idea.coin} — {side}: الإجماع يقوى*",
+        "",
+        f"• انضم {joined} متداول جديد",
+        f"• الصار العدد: *{len(idea.members)}* من {', '.join(sorted(idea.sources))}",
+        f"• الصفقة مفتوحة من `{_g(idea.opened_at)}`",
+        "",
+        "ما في شي تسويه — نفس الصفقة، صارت أقوى.",
+    ])
+
+
+def narrate_idea_exit(idea, left: int, remaining: int, r=None) -> str:
+    """The exit message — the half that was missing.
+
+    It states what happened and what the position is worth. It does not say
+    "close now", because whether these traders' exits carry information is an
+    empirical question, and pretending otherwise would be a guess dressed as
+    advice.
+    """
+    side = _AR_SIDE.get(idea.side, idea.side)
+    reason = _AR_EXIT_REASON.get(idea.exit_reason or "", "خروج")
+
+    out = [
+        f"🚪 *{idea.coin} — {side}: المحترفون يخرجون*",
+        "",
+        f"• السبب: {reason}",
+        f"• خرج {left} من أصل {left + remaining} متداول",
+    ]
+    if r is not None:
+        if r > 0:
+            out.append(f"• نتيجتك الآن: *{r:+.2f}R* — ربح")
+        else:
+            out.append(f"• نتيجتك الآن: *{r:+.2f}R* — خسارة")
+    if idea.best_price and idea.entry:
+        peak = idea.r_of(idea.best_price)
+        if peak is not None and r is not None and peak > r:
+            out.append(f"• أعلى نقطة وصلتها: {peak:+.2f}R (أعطيت منها {peak - r:.2f}R)")
+
+    out += [
+        "",
+        f"• الدخول كان `{_g(idea.entry)}` · الآن `{_g(idea.exit_price)}`",
+        "",
+        "القرار لك: تخرج معهم أو تكمل على ستوبك.",
+        "",
+        "⚠️ ليست نصيحة مالية · HYPOTHETICAL_",
+    ]
+    return "\n".join(out)
+
+
+def narrate_idea_expired(idea, age_h: float, r=None) -> str:
+    side = _AR_SIDE.get(idea.side, idea.side)
+    out = [
+        f"⏳ *{idea.coin} — {side}: انتهت مدة المتابعة*",
+        "",
+        f"• مضى {age_h:.0f} ساعة بلا حسم",
+    ]
+    if r is not None:
+        out.append(f"• النتيجة: *{r:+.2f}R*")
+    out += ["", "توقفت عن متابعتها. الصفقة لسه مفتوحة عندك إذا دخلت."]
+    return "\n".join(out)
+
+
+def _g(value) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)

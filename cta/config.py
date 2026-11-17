@@ -117,6 +117,13 @@ class Config:
     discovery_fetch_retries: int = 2    # worst-case cost is retries + 1 per call
     candidate_page_size: int = 0        # 0 = derive from the budget
 
+    # ── trade lifecycle ────────────────────────────────────────────────────
+    # Fraction of the traders behind an open idea who must leave before we
+    # report an exit. 0.5 means "half of them are out".
+    idea_exit_fraction: float = 0.5
+    # An idea is tracked for this long before it is closed as unresolved.
+    idea_max_age_h: float = 72.0
+
     # ── watchlist persistence ───────────────────────────────────────────────
     # A resumable search scores ~10 wallets per invocation, so a pass takes
     # hours. Without a floor the watchlist would flap to zero between passes

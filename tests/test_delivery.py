@@ -271,3 +271,53 @@ def test_data_confirmation_is_not_a_hardcoded_source():
     # because the alternative silently disables every new source.
     assert engine_rule(Plain()) is True
     assert resume_rule(Plain()) is True
+
+
+async def test_a_failed_lifecycle_message_is_recorded_too(sim_venues):
+    """An exit alert that never arrives is worse than an entry that never
+    arrives: the operator is holding a position believing someone is watching
+    it. So the lifecycle path must record failures exactly as the raw path
+    does — and it did not, at first, because it never went through `_send`.
+    """
+    store = MemoryStore()
+    fetch = RecordingFetch(telegram_ok=False)
+    ideas_seen = 0
+    for _ in range(10):
+        report = await run_cycle_async(_env(store), fetch)
+        ideas_seen += int(report.get("ideas_opened") or 0)
+        if ideas_seen:
+            break
+
+    if not ideas_seen:
+        pytest.skip("no idea opened in this run")
+
+    failures = await store.get("delivery_failures", []) or []
+    assert failures, "a rejected lifecycle message vanished with no trace"
+    assert any(
+        ":" in str(f.get("signal_id", "")) for f in failures
+    ), f"only raw signals were recorded: {failures}"
+
+
+async def test_the_failure_recorder_cannot_be_silenced_by_a_bad_clock():
+    """The recorder was passing the clock *function* instead of calling it, so
+    `now.isoformat()` raised inside the `except: pass` and the failure was lost.
+
+    A component whose only job is to report failures must not have a code path
+    where it fails silently.
+    """
+    from cta.runtime import _send
+
+    class RefusingTelegram:
+        async def send(self, text, keyboard=None):
+            return {"ok": False, "error": "chat not found"}
+
+    store = MemoryStore()
+
+    # A callable in the clock slot is exactly the mistake that was made.
+    delivered = await _send(
+        RefusingTelegram(), store, "hello", label="x",
+        _now=lambda: datetime.now(UTC),
+    )
+    assert delivered == 0
+    failures = await store.get("delivery_failures", []) or []
+    assert failures, "the recorder swallowed its own error"

@@ -36,6 +36,53 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+async def _send(tg, store, text: str, label: str, coin: str = "",
+                keyboard=None, _now=None, cap: int = 50) -> int:
+    """Send one message and record any failure.
+
+    Every delivery path must go through here. A rejected send that leaves no
+    trace is the worst failure this system has: the operator sees silence and
+    cannot tell a quiet market from a broken one. An exit alert that never
+    arrives is worse still than an entry that never arrives, because the
+    operator is holding a position while believing someone is watching it.
+    """
+    # `_now` used to be passed as the function rather than called, so
+    # `now.isoformat()` raised and the bare `except Exception: pass` below
+    # swallowed it. The recorder built to surface failed sends was itself
+    # failing silently. Anything that can raise while building the record is
+    # now settled first, outside the try that records it.
+    if callable(_now):
+        _now = _now()
+    now = _now or datetime.now(UTC)
+    try:
+        stamp = now.isoformat()
+    except Exception:
+        stamp = ""
+
+    try:
+        result = await tg.send(text, keyboard=keyboard)
+    except Exception as exc:  # noqa: BLE001
+        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    if result.get("ok"):
+        return 1
+
+    try:
+        detail = str(result.get("error") or result.get("description") or "")[:200]
+    except Exception:
+        detail = ""
+    try:
+        await store.append(
+            "delivery_failures",
+            {"signal_id": str(label), "coin": str(coin), "at": stamp,
+             "error": detail},
+            cap=cap,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Last resort: a failure we cannot store must still be visible.
+        print(f"[cta] delivery failed and could not be recorded: {exc}")
+    return 0
+
+
 async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     """One full radar cycle. Returns a JSON-serialisable report."""
     fetch = as_fetcher(fetch)
@@ -81,6 +128,15 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
         payload = sig.to_dict()
         await remember_signal(store, payload)
 
+    # Reference prices, fetched once and shared: bookkeeping and the lifecycle
+    # both need them, and asking twice would double the request cost.
+    from .engine import market_prices
+
+    try:
+        prices = await market_prices(venues)
+    except Exception:
+        prices = {}
+
     # ── paper account: take EVERY signal automatically ──────────────────────
     # The operator asked for exactly this: record every signal whether or not
     # they entered it, on a fixed $100 account, so the result is measurable
@@ -102,20 +158,55 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
                 paper, sig.to_dict(), risk_pct=cfg.paper_risk_pct, now=_now()
             )
 
-        # Every venue that can price a coin contributes; asking only
-        # Hyperliquid meant the paper account stopped being marked to market
-        # the moment that one venue was unavailable.
-        from .engine import market_prices
-
-        try:
-            prices = await market_prices(venues)
-        except Exception:
-            prices = {}
         paper = mark_to_market(paper, prices or {})
         await store.set(KEY_PAPER, paper)
     except Exception as exc:
         # Never let bookkeeping break the cycle, but do record it.
         print(f"[cta] paper account failed: {type(exc).__name__}: {exc}")
+
+    # ── the trade lifecycle ─────────────────────────────────────────────────
+    # Every signal above is a *cluster*. What the operator trades is an *idea*:
+    # one thesis per coin per direction, followed until the traders who created
+    # it leave. Without this the channel carried 91 messages for 10 ideas and
+    # nobody ever heard when a trade was over.
+    lifecycle_events: list[dict] = []
+    try:
+        from .lifecycle import (
+            exposure_map,
+            load_ideas,
+            reconcile,
+            record_close,
+            save_ideas,
+        )
+
+        from .engine import collect_positions
+
+        ideas = await load_ideas(store)
+        wl = await get_watchlist(store)
+        positions = await collect_positions(venues, wl, cfg)
+
+        lifecycle_events = reconcile(
+            ideas,
+            signals,
+            exposure_map(positions),
+            {name for name, ok in (health or {}).items() if ok},
+            prices or {},
+            _now(),
+            exit_fraction=cfg.idea_exit_fraction,
+            max_age_h=cfg.idea_max_age_h,
+        )
+        for event in lifecycle_events:
+            if event["kind"] in ("exit", "expired"):
+                await record_close(
+                    store, event["idea"], event["idea"].exit_price, _now()
+                )
+        # Drop closed ideas so a later cycle cannot resurrect them.
+        ideas = {k: v for k, v in ideas.items() if v.exited_at is None}
+        await save_ideas(store, ideas)
+    except Exception as exc:  # noqa: BLE001
+        # The lifecycle is an improvement to the product, not the product. If
+        # it breaks, the raw signal must still reach the operator.
+        print(f"[cta] lifecycle failed: {type(exc).__name__}: {exc}")
 
     # ── delivery ────────────────────────────────────────────────────────────
     # This used to sit inside the paper-account `except` block. That meant a
@@ -126,28 +217,60 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     # Delivery is the product. It gets its own loop, outside every try/except
     # that could swallow it, and a failed send is recorded rather than dropped.
     if not cfg.dry_run and tg.configured:
-        for sig in signals:
-            try:
-                keyboard = signal_keyboard(sig.signal_id)
-                result = await tg.send(narrate_signal(sig), keyboard=keyboard)
-            except Exception as exc:  # noqa: BLE001
-                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            if result.get("ok"):
-                delivered += 1
+        # ── lifecycle messages first: they are about positions the operator
+        # already holds, which matters more than anything new.
+        from .ai import (
+            narrate_idea_exit,
+            narrate_idea_expired,
+            narrate_idea_open,
+            narrate_idea_strengthen,
+        )
+
+        for event in lifecycle_events:
+            kind = event["kind"]
+            idea = event["idea"]
+            if kind == "enter":
+                text = narrate_idea_open(idea, event.get("signal"))
+            elif kind == "strengthen":
+                text = narrate_idea_strengthen(idea, event.get("joined", 0))
+            elif kind == "exit":
+                text = narrate_idea_exit(
+                    idea, event.get("left", 0), event.get("remaining", 0),
+                    event.get("r"),
+                )
+            elif kind == "expired":
+                text = narrate_idea_expired(
+                    idea, event.get("age_h", 0.0), event.get("r")
+                )
             else:
-                try:
-                    await store.append(
-                        "delivery_failures",
-                        {
-                            "signal_id": sig.signal_id,
-                            "coin": sig.coin,
-                            "at": _now().isoformat(),
-                            "error": str(result.get("error", ""))[:200],
-                        },
-                        cap=50,
-                    )
-                except Exception:
-                    pass
+                continue
+            delivered += await _send(
+                tg, store, text, label=f"{kind}:{idea.key}", coin=idea.coin,
+                _now=_now(),
+            )
+
+        # ── raw signals, only when they were not already delivered as an idea.
+        #
+        # This is the 89% cut. A second consensus on a live idea is confirmation,
+        # not a new trade; paging the operator for it is how a channel becomes
+        # noise they mute.
+        delivered_as_idea = set()
+        for event in lifecycle_events:
+            for sid in (event.get("idea").signal_ids if event.get("idea") else []):
+                delivered_as_idea.add(sid)
+
+        for sig in signals:
+            if sig.signal_id in delivered_as_idea:
+                continue
+            delivered += await _send(
+                tg,
+                store,
+                narrate_signal(sig),
+                label=sig.signal_id,
+                coin=sig.coin,
+                keyboard=signal_keyboard(sig.signal_id),
+                _now=_now(),
+            )
 
     # The positions cache must NOT re-poll the watchlist.
     #
@@ -192,6 +315,9 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
         "watchlist": report.get("watchlist_size", 0),
         "clusters": report.get("clusters", 0),
         "signals": len(signals),
+        "ideas_opened": sum(1 for e in lifecycle_events if e["kind"] == "enter"),
+        "ideas_closed": sum(1 for e in lifecycle_events
+                            if e["kind"] in ("exit", "expired")),
         "delivered": delivered,
         "source_health": health,
     }
