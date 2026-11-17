@@ -24,6 +24,7 @@ from .state import (
     get_signals,
     get_watchlist,
     remember_signal,
+    resilient,
     store_from_env,
 )
 from .telegram import Telegram, signal_keyboard
@@ -39,7 +40,9 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     """One full radar cycle. Returns a JSON-serialisable report."""
     fetch = as_fetcher(fetch)
     cfg = cfg or Config.from_env(env)
-    store = store_from_env(env)
+    # State is telemetry. A locked database or a full disk must slow the radar
+    # down and be reported — never stop it from looking at the market.
+    store = resilient(store_from_env(env))
     venues = build_venues(fetch, cfg)
 
     health = {}
@@ -161,6 +164,15 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
         pass
 
     await store.set("last_cycle_at", _now().isoformat())
+    await store.set(
+        "store_health",
+        {
+            "degraded": bool(getattr(store, "degraded", False)),
+            "last_error": getattr(store, "last_error", "")[:160],
+            "writes": getattr(store, "writes", 0),
+            "failed": len(getattr(store, "failures", []) or []),
+        },
+    )
     counters = await store.get("counters", {}) or {}
     # `cycles` was already incremented when the attempt started; only the
     # outcome counters are added here.
@@ -171,6 +183,11 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
 
     return {
         "ok": True,
+        # A degraded store is reported, not hidden: silently keeping the radar
+        # alive while its memory rots would leave the operator trusting numbers
+        # that are quietly no longer being saved.
+        "store_degraded": bool(getattr(store, "degraded", False)),
+        "store_error": getattr(store, "last_error", "")[:160],
         "profile": report.get("profiled"),
         "watchlist": report.get("watchlist_size", 0),
         "clusters": report.get("clusters", 0),
@@ -219,7 +236,9 @@ async def run_profile_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     from .engine import profile_watchlist_resumable
 
     cfg = cfg or Config.from_env(env)
-    store = store_from_env(env)
+    # State is telemetry. A locked database or a full disk must slow the radar
+    # down and be reported — never stop it from looking at the market.
+    store = resilient(store_from_env(env))
     venues = build_venues(fetch, cfg)
 
     try:
@@ -265,7 +284,9 @@ async def handle_telegram_async(env, fetch, update: dict) -> dict:
     """Route one Telegram update."""
     fetch = as_fetcher(fetch)
     cfg = Config.from_env(env)
-    store = store_from_env(env)
+    # State is telemetry. A locked database or a full disk must slow the radar
+    # down and be reported — never stop it from looking at the market.
+    store = resilient(store_from_env(env))
     tg = Telegram(fetch, getattr(env, "TELEGRAM_BOT_TOKEN", ""), getattr(env, "TELEGRAM_CHAT_ID", ""))
     bot = Bot(tg, store, env=env, cfg=cfg)
     return await bot.handle_update(update)
@@ -328,6 +349,12 @@ async def self_test_async(env, fetch) -> dict:
     out: dict = {"ok": True, "checks": {}}
 
     # 1. state
+    #
+    # The cycle wraps the store in `resilient()` so a backend outage cannot stop
+    # the radar. A *diagnostic* must do the opposite: it has to touch the real
+    # backend, because a wrapper that answers from memory would report a broken
+    # Durable Object as healthy and turn this check into a lie. So the probe
+    # deliberately uses the raw store.
     store = store_from_env(env)
     probe = f"selftest:{datetime.now(UTC).timestamp()}"
     try:
@@ -421,7 +448,9 @@ async def self_test_async(env, fetch) -> dict:
 async def track_outcomes_async(env, fetch, cfg: Optional[Config] = None) -> dict:
     """Re-price stored signals and refresh the stats the bot reports."""
     cfg = cfg or Config.from_env(env)
-    store = store_from_env(env)
+    # State is telemetry. A locked database or a full disk must slow the radar
+    # down and be reported — never stop it from looking at the market.
+    store = resilient(store_from_env(env))
     venues = build_venues(fetch, cfg)
 
     prices: dict[str, float] = {}
@@ -453,7 +482,9 @@ async def track_outcomes_async(env, fetch, cfg: Optional[Config] = None) -> dict
 async def boot_async(env, fetch) -> dict:
     """First-run setup: webhook registration + watchlist if empty."""
     cfg = Config.from_env(env)
-    store = store_from_env(env)
+    # State is telemetry. A locked database or a full disk must slow the radar
+    # down and be reported — never stop it from looking at the market.
+    store = resilient(store_from_env(env))
     tg = Telegram(fetch, getattr(env, "TELEGRAM_BOT_TOKEN", ""), getattr(env, "TELEGRAM_CHAT_ID", ""))
 
     result: dict[str, Any] = {"ok": True, "steps": []}

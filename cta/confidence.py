@@ -43,8 +43,28 @@ def _level_for(total: int) -> str:
     return "REJECT"
 
 
-def score_cluster(cluster: Cluster, cfg: Optional[Config] = None) -> Confidence:
-    """Score a cluster out of 100 and explain the arithmetic."""
+def score_cluster(
+    cluster: Cluster,
+    cfg: Optional[Config] = None,
+    opposition: float = 0.0,
+) -> Confidence:
+    """Score a cluster out of 100 and explain the arithmetic.
+
+    `opposition` is the weight of independent traders clustered on the *other*
+    side of the same coin. It matters because a consensus is only a consensus
+    while it points one way.
+
+    This component was missing entirely. On a market split 4-against-4 the radar
+    emitted two STRONG signals for the same coin in the same minute — one LONG,
+    one SHORT — each scoring 88/100 on its own merits. Both were arithmetically
+    correct and jointly useless: the operator was told to buy and to sell at
+    once, which is worse than being told nothing, because it spends the trust
+    the whole system runs on.
+
+    The comparison is relative, not a fixed threshold: a small opposition
+    against a large consensus is noise and costs nothing, while opposition at
+    parity means nobody actually agrees.
+    """
     cfg = cfg or Config()
     reasons: list[str] = []
     breakdown: dict[str, int] = {}
@@ -98,7 +118,37 @@ def score_cluster(cluster: Cluster, cfg: Optional[Config] = None) -> Confidence:
     else:
         reasons.append(f"كل المتداولين من منصة واحدة ({', '.join(cluster.sources)}) → 0/5")
 
-    total = max(0, min(100, consensus + quality + tightness + sync + diversity))
+    # ── F. disagreement: a consensus is only one while it points one way ────
+    total = consensus + quality + tightness + sync + diversity
+
+    if opposition > 0 and n > 0:
+        # How contested is this call? 0.0 = unopposed, 1.0 = perfectly balanced.
+        ratio = opposition / float(n + opposition)
+        # Balanced disagreement must hurt badly; a 4:1 majority should cost
+        # almost nothing. Squaring the imbalance does that without a tunable
+        # constant.
+        #
+        # The 0.45 ceiling is deliberately partial. Suppressing every contested
+        # call re-creates the most expensive failure this system has: silence
+        # that looks exactly like a quiet market. A 2:1 majority among
+        # professionals is still information; it just has to say so.
+        contested = max(0.0, 1.0 - abs(0.5 - ratio) * 2.0)
+        penalty = int(round(total * 0.45 * contested * contested))
+        if penalty:
+            total -= penalty
+            breakdown["disagreement"] = -penalty
+            reasons.append(
+                f"السوق منقسم: {n} مع الاتجاه مقابل {opposition:.0f} ضده "
+                f"→ −{penalty}"
+            )
+        if contested >= 0.9:
+            # Near parity. There is no consensus here, only a crowd: telling
+            # the operator to buy and to sell at the same moment spends the
+            # one thing the whole system runs on.
+            level = "REJECT"
+            reasons.append("لا إجماع: الاتجاهان متكافئان تقريباً")
+
+    total = max(0, min(100, total))
     level = _level_for(total)
 
     # ── hard overrides: never emit below the configured bar ─────────────────

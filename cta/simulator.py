@@ -181,6 +181,8 @@ class SimVenue:
         now: Optional[datetime] = None,
         wallet_prefix: str = "0xsim",
         market: Optional[Market] = None,
+        max_position_age_h: float = 36.0,
+        max_order_age_h: float = 6.0,
     ):
         self.rng = random.Random(seed)
         # One shared market by default. Two venues must quote the same asset at
@@ -207,6 +209,10 @@ class SimVenue:
         self._history: dict[str, list[Fill]] = {}
         self._positions: dict[str, list[Position]] = {}
         self._orders: dict[str, list[Order]] = {}
+        self._realised: dict[str, list[Position]] = {}
+        # Positions and orders do not live forever. See `settle`.
+        self.max_position_age_h = max_position_age_h
+        self.max_order_age_ms = int(max_order_age_h * 3_600_000)
         self._build_history()
         self.events: list[dict] = []
         # A sibling venue, so an agreement can span two platforms: the rarest
@@ -233,9 +239,101 @@ class SimVenue:
         if self.market._advanced_at != self.market.now:
             self.market.step(minutes)
             self.market._advanced_at = self.market.now
+            # Prices moved, so stops and targets may have been reached — and
+            # with them the reason a position is still open.
+            self.settle()
+            if self._primary:
+                for partner in (self.partner,):
+                    if partner is not None:
+                        partner.settle()
 
     def now_ms(self) -> int:
         return int(self.now.timestamp() * 1000)
+
+    def _close_opposing(self, wallet: str, coin: str, side: str) -> None:
+        """Close this wallet's positions on `coin` that face the other way."""
+        book = self._positions.get(wallet)
+        if not book:
+            return
+        want_positive = side == "LONG"
+        kept = [p for p in book if not (
+            p.coin == coin and (p.signed_size >= 0) != want_positive
+        )]
+        if len(kept) != len(book):
+            self._realised.setdefault(wallet, []).extend(
+                p for p in book if p not in kept
+            )
+            if kept:
+                self._positions[wallet] = kept
+            else:
+                self._positions.pop(wallet, None)
+        # Resting orders facing the other way go too.
+        orders = self._orders.get(wallet)
+        if orders:
+            kept_o = [o for o in orders if not (
+                o.coin == coin and o.side != side
+            )]
+            if kept_o:
+                self._orders[wallet] = kept_o
+            else:
+                self._orders.pop(wallet, None)
+
+    def settle(self) -> int:
+        """Close positions whose stop or target the market has reached.
+
+        Without this, simulated positions never closed, and a long run became
+        steadily less like reality: every trader accumulated a LONG and a SHORT
+        on every coin at once. By cycle 40 the radar was looking at a market
+        where nobody agreed with anybody, and stayed silent for 400 cycles.
+
+        That silence was the *radar being right* — and it hid a genuine fault.
+        Had the disagreement logic not existed, the same stale book would have
+        produced LONG and SHORT alerts on the same coin at the same time, which
+        is what a real 24/7 deployment would have done after a few days.
+
+        Positions also expire, because a trader who never closes is not
+        modelling anything.
+        """
+        closed = 0
+        max_age = timedelta(hours=self.max_position_age_h)
+        for wallet, book in list(self._positions.items()):
+            kept: list[Position] = []
+            for p in book:
+                px = self.market.price(p.coin)
+                hit = False
+                if p.signed_size >= 0:
+                    if p.stop and px <= p.stop:
+                        hit = True
+                    elif p.target and px >= p.target:
+                        hit = True
+                else:
+                    if p.stop and px >= p.stop:
+                        hit = True
+                    elif p.target and px <= p.target:
+                        hit = True
+                aged_out = p.opened_at is not None and (self.now - p.opened_at) > max_age
+                if hit or aged_out:
+                    self._realised.setdefault(wallet, []).append(p)
+                    closed += 1
+                else:
+                    kept.append(p)
+            if kept:
+                self._positions[wallet] = kept
+            else:
+                self._positions.pop(wallet, None)
+        # Resting orders expire too: an order left open forever is a lie about
+        # intent, and it would keep generating "pending" consensus forever.
+        for wallet, book in list(self._orders.items()):
+            kept_orders = [
+                o for o in book
+                if not (o.placed_ms and
+                        (self.now_ms() - o.placed_ms) > self.max_order_age_ms)
+            ]
+            if kept_orders:
+                self._orders[wallet] = kept_orders
+            else:
+                self._orders.pop(wallet, None)
+        return closed
 
     # ── history: what the classifier judges ─────────────────────────────────
     def _build_history(self) -> None:
@@ -297,6 +395,13 @@ class SimVenue:
         base = self.market.price(coin)
         placed: list[dict] = []
         for i, t in enumerate(chosen):
+            # Taking a view closes the opposite view. A trader who opens a LONG
+            # while still holding a SHORT on the same coin is not "hedging",
+            # they are a simulator artefact — and a book full of them makes
+            # every coin look permanently split, so the radar (correctly) never
+            # finds a consensus. Real traders flip; they do not accumulate both
+            # sides for a week.
+            self._close_opposing(t.wallet, coin, side)
             # A few basis points apart: inside the tolerance, not identical.
             px = base * (1.0 + self.rng.uniform(-0.0012, 0.0012))
             size_usd = t.account_value * t.leverage * 0.20

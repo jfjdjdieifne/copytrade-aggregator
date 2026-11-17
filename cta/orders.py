@@ -117,16 +117,20 @@ def attach_protective(
     Only levels that agree with the position are attached: a take-profit above
     a long and a stop-loss below it. Anything on the wrong side is ignored,
     because the trader may be hedging, closing partially, or simply wrong.
+
+    Matching is on (wallet, coin, side) — never on the wallet alone.
     """
-    by_wallet: dict[str, list[Order]] = {}
+    by_key: dict[tuple[str, str, str], list[Order]] = {}
     for o in orders:
         if o.kind not in ("tp", "sl"):
             continue
-        by_wallet.setdefault(o.wallet, []).append(o)
+        if not o.wallet or not o.coin:
+            continue
+        by_key.setdefault((o.wallet, o.coin, (o.side or "").upper()), []).append(o)
 
     attached = 0
     for pos in positions:
-        mine = by_wallet.get(pos.wallet)
+        mine = by_key.get((pos.wallet, pos.coin, pos.side))
         if not mine:
             continue
         if pos.is_long:

@@ -13,6 +13,8 @@ Pipeline:
 
 from __future__ import annotations
 
+import math
+
 from datetime import datetime, timezone
 from typing import Iterable, Optional, Sequence
 
@@ -126,21 +128,40 @@ def _cluster_by_price(
     if not positions:
         return []
 
-    remaining = sorted(positions, key=lambda p: p.entry)
+    # A single non-finite entry price used to hang this function forever.
+    #
+    # `if base <= 0` is False for NaN, so a NaN seed was never skipped. Its band
+    # was NaN too, so no position compared within it, the cluster came back
+    # empty, `remaining` was unchanged, and the `while` loop spun forever. On a
+    # server that looks like a healthy process: CPU pegged, no error, no alerts,
+    # no sign anything is wrong. One NaN price from one venue was enough.
+    #
+    # Non-finite prices are dropped here, at the boundary where they stop being
+    # data and start being control flow.
+    usable = [p for p in positions if _is_finite_price(p.entry) and p.entry > 0]
+    remaining = sorted(usable, key=lambda p: p.entry)
     clusters: list[list[Position]] = []
 
     while remaining:
         seed = remaining[0]
         base = seed.entry
-        if base <= 0:
-            remaining = remaining[1:]
-            continue
         band = base * tolerance_bps / BPS
         cluster = [p for p in remaining if abs(p.entry - base) <= band]
+        if not cluster:  # belt and braces: never let the loop stall
+            remaining = remaining[1:]
+            continue
         clusters.append(cluster)
         remaining = [p for p in remaining if p not in cluster]
 
     return clusters
+
+
+def _is_finite_price(value: object) -> bool:
+    """True only for a real, finite, positive number we can do arithmetic with."""
+    try:
+        return math.isfinite(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
 
 
 # ── step 4: orchestration ────────────────────────────────────────────────────

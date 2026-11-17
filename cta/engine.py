@@ -423,7 +423,16 @@ async def collect_positions(
             raw = await venue.positions(wallet)
         except Exception:
             continue
-        parsed = venue.parse_positions(wallet, raw)
+        if not isinstance(raw, list):
+            # A venue that answers `None` — a transient null, an API change, a
+            # proxy's error page parsed as JSON — used to raise straight through
+            # `parse_positions` and kill the whole cycle. One bad venue took the
+            # radar down for every other source too.
+            continue
+        try:
+            parsed = venue.parse_positions(wallet, raw)
+        except Exception:
+            continue
         grade, score = quality_by_wallet.get(wallet, ("WATCH", 0))
         for p in parsed:
             p.quality = grade
@@ -454,6 +463,10 @@ async def market_prices(venues: dict) -> dict[str, float]:
         try:
             quote = await venue.prices()
         except Exception:
+            continue
+        if not isinstance(quote, dict):
+            # A list, a string, a null: not a price book. Skipping one venue's
+            # quotes is a degraded cycle; crashing is a dead radar.
             continue
         for coin, px in (quote or {}).items():
             try:
@@ -508,7 +521,12 @@ async def collect_orders(
             raw = await venue.open_orders(wallet)
         except Exception:
             continue
-        parsed = venue.parse_open_orders(wallet, raw, prices=prices)
+        if not isinstance(raw, list):
+            continue  # see `collect_positions`: one bad venue must not end the cycle
+        try:
+            parsed = venue.parse_open_orders(wallet, raw, prices=prices)
+        except Exception:
+            continue
         grade, score = quality_by_wallet.get(wallet, ("WATCH", 0))
         for o in parsed:
             o.quality = grade
@@ -534,12 +552,17 @@ def build_signal(
     atr_hint: Optional[float] = None,
     now: Optional[datetime] = None,
     kind: str = "filled",
+    opposition: float = 0.0,
 ) -> Optional[Signal]:
-    """Turn a passing cluster into a fully explainable Signal (or None)."""
+    """Turn a passing cluster into a fully explainable Signal (or None).
+
+    `opposition` is the weight of independent traders who clustered on the other
+    side of this coin. See `score_cluster` for why it is part of the score.
+    """
     cfg = cfg or Config()
     now = now or datetime.now(UTC)
 
-    conf = score_cluster(cluster, cfg)
+    conf = score_cluster(cluster, cfg, opposition=opposition)
     if not conf.emitted:
         return None
 
@@ -697,6 +720,16 @@ async def scan(
     ]
     pending_keys = {(c.coin, c.side, round(c.entry_center, 6)) for c in pending_clusters}
 
+    # How contested is each call? Measured across every cluster found this
+    # cycle — including the ones that will not be emitted — because the
+    # operator's question is not "do four traders agree" but "does anyone
+    # disagree as strongly".
+    opposition_by_key: dict[tuple[str, str], float] = {}
+    for cluster in clusters:
+        other = "SHORT" if cluster.side == "LONG" else "LONG"
+        opposition_by_key.setdefault((cluster.coin, other), 0.0)
+        opposition_by_key[(cluster.coin, other)] += float(cluster.n_members)
+
     seen = set(await store.get("seen_signal_ids", []) or [])
     emitted: list[Signal] = []
     rejected: list[dict] = []
@@ -707,11 +740,13 @@ async def scan(
             if (cluster.coin, cluster.side, round(cluster.entry_center, 6)) in pending_keys
             else "filled"
         )
-        sig = build_signal(cluster, cfg, market_price=price, now=now, kind=kind)
+        against = opposition_by_key.get((cluster.coin, cluster.side), 0.0)
+        sig = build_signal(cluster, cfg, market_price=price, now=now, kind=kind,
+                           opposition=against)
         if sig is None:
             # Record *why* a cluster died. "No signal" with no explanation is the
             # single least trustworthy thing a monitoring system can report.
-            conf = score_cluster(cluster, cfg)
+            conf = score_cluster(cluster, cfg, opposition=against)
             reason = (conf.reasons or ["لم تجتز شروط الجودة"])[0]
             rejected.append(
                 {

@@ -267,3 +267,89 @@ async def record_chat(store: Store, chat_id: str, role: str, content: str, cap: 
 async def get_chat_history(store: Store, chat_id: str, limit: int = 8) -> list[dict]:
     history = await store.get(f"{KEY_MEMORY}:{chat_id}", []) or []
     return history[-limit:]
+
+
+class ResilientStore:
+    """A store that keeps the radar running when the state backend fails.
+
+    Why this exists
+    ---------------
+    `run_cycle_async` writes counters, the watchlist, and the signal history
+    through `store`. Every one of those writes used to be an unguarded `await
+    store.set(...)`, so any backend failure — a locked SQLite file, a full
+    disk, a Durable Object that briefly refuses — propagated straight out of
+    the cycle and killed it.
+
+    That is backwards. State is *telemetry*: it records what the radar
+    measured. A measurement that can destroy the thing it measures is worse
+    than no measurement. The operator wants the alert even if the ledger is
+    unwritable; they do not want a silent radar because a disk filled up.
+
+    So writes that fail are remembered in memory — keeping the rest of the
+    cycle internally consistent, since a later read must not return the value
+    before the failed write — and counted, so the degradation is visible
+    rather than invisible. `degraded` is reported by `/health`.
+    """
+
+    def __init__(self, inner: Store) -> None:
+        self.inner = inner
+        self._shadow: dict[str, Any] = {}
+        self.failures: list[str] = []
+        self.writes = 0
+        self.reads = 0
+
+    @property
+    def degraded(self) -> bool:
+        return bool(self.failures)
+
+    @property
+    def last_error(self) -> str:
+        return self.failures[-1] if self.failures else ""
+
+    def _note(self, what: str, exc: BaseException) -> None:
+        self.failures.append(f"{what}: {type(exc).__name__}: {exc}"[:200])
+
+    async def get(self, key: str, default: Any = None) -> Any:
+        self.reads += 1
+        try:
+            value = await self.inner.get(key, self._shadow.get(key, default))
+        except Exception as exc:  # noqa: BLE001
+            self._note(f"read {key}", exc)
+            return self._shadow.get(key, default)
+        # A backend that accepted the write but lost it (or that we fell back
+        # for) must still see the last value this cycle believes is true.
+        if value is None and key in self._shadow:
+            return self._shadow[key]
+        return value
+
+    async def set(self, key: str, value: Any) -> None:
+        self.writes += 1
+        self._shadow[key] = value
+        try:
+            await self.inner.set(key, value)
+        except Exception as exc:  # noqa: BLE001
+            self._note(f"write {key}", exc)
+
+    async def append(self, key: str, item: Any, cap: int = 500) -> list:
+        bucket = list(self._shadow.get(key, []))
+        bucket.append(item)
+        if len(bucket) > cap:
+            bucket = bucket[-cap:]
+        self._shadow[key] = bucket
+        try:
+            return await self.inner.append(key, item, cap=cap)
+        except Exception as exc:  # noqa: BLE001
+            self._note(f"append {key}", exc)
+            return bucket
+
+    async def delete(self, key: str) -> None:
+        self._shadow.pop(key, None)
+        try:
+            await self.inner.delete(key)
+        except Exception as exc:  # noqa: BLE001
+            self._note(f"delete {key}", exc)
+
+
+def resilient(store: Store) -> ResilientStore:
+    """Wrap a store so a backend outage degrades the radar, never stops it."""
+    return store if isinstance(store, ResilientStore) else ResilientStore(store)
