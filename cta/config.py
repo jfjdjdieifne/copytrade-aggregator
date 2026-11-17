@@ -135,6 +135,12 @@ class Config:
     hl_clearinghouse_weight: int = 2
     hl_userfills_weight: int = 20
     poll_interval_sec: int = 60
+    # Proof of life. The operator sees the world through Telegram and nothing
+    # else, so the radar reports on a fixed cadence with counts that move.
+    # First report after 5 minutes, then every `heartbeat_minutes`.
+    heartbeat_minutes: float = 30.0
+    # Set False to silence the periodic report entirely (signals still arrive).
+    heartbeat_enabled: bool = True
     max_fills_per_profile: int = 2000
 
     # ── convergence gates ───────────────────────────────────────────────────

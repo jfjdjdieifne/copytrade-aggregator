@@ -29,7 +29,7 @@ from .runtime import (
     run_profile_async,
     track_outcomes_async,
 )
-from .state import store_from_env
+from .state import KEY_WATCHLIST, store_from_env
 
 UTC = timezone.utc
 
@@ -186,11 +186,60 @@ async def cmd_track(env: LocalEnv) -> int:
     return 0
 
 
+async def _heartbeat_targets(env) -> tuple[bool, str, str]:
+    """(enabled, token, chat_id) — the operator's channel, or nothing."""
+    return (
+        True,
+        str(getattr(env, "TELEGRAM_BOT_TOKEN", "") or ""),
+        str(getattr(env, "TELEGRAM_CHAT_ID", "") or ""),
+    )
+
+
+async def _emit(env, text: str) -> None:
+    """Push one message to the operator. A heartbeat that cannot be delivered
+    must not take the radar down, and must not be reported as delivered."""
+    from .telegram import Telegram
+
+    try:
+        _, token, chat_id = await _heartbeat_targets(env)
+        if not token or not chat_id:
+            print("[heartbeat] لا يوجد TELEGRAM_BOT_TOKEN/CHAT_ID — التقرير للّوج فقط")
+            print(text)
+            return
+        tg = Telegram(_stdlib_fetch, token, chat_id)
+        sent = await tg.send(text, chat_id)
+        if not sent.get("ok"):
+            print(f"[heartbeat] ✗ فشل الإرسال: {sent.get('error', '')[:120]}")
+            print(text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[heartbeat] ✗ {type(exc).__name__}: {exc}")
+        print(text)
+
+
 async def cmd_run(env: LocalEnv, interval: int = 60) -> int:
     """Long-running loop for a VPS — the Cloudflare cron equivalent."""
+    from .heartbeat import (
+        KEY_LAST_POSITIONS,
+        Pulse,
+        boot_message,
+        rows_to_positions,
+    )
+
+    cfg = Config.from_env(env)
+    store = store_from_env(env)
+    pulse = Pulse(store=store, interval_min=getattr(cfg, "heartbeat_minutes", 30.0))
+
     print(f"▶ بدء الحلقة كل {interval} ثانية. Ctrl+C للإيقاف.")
     if getattr(env, "SIM", "") in ("1", "true", "yes"):
         print("  (SIM=1: المصادر مُفبرَكة — نفس خط الأنابيب، لا شبكة)")
+
+    # Announce the boot. Its job is not reassurance — it is a baseline, so the
+    # operator can see the next report *move* instead of taking "شغال" on faith.
+    if getattr(cfg, "heartbeat_enabled", True):
+        await _emit(env, boot_message(
+            health=None, watchlist=0, interval_min=pulse.interval_min,
+        ))
+
     while True:
         started = time.monotonic()
         try:
@@ -198,7 +247,22 @@ async def cmd_run(env: LocalEnv, interval: int = 60) -> int:
             print(f"[{datetime.now(UTC):%H:%M:%S}] " + json.dumps(result, ensure_ascii=False))
             await track_outcomes_async(env, _stdlib_fetch)
         except Exception as exc:  # noqa: BLE001
+            result = {"error": f"{type(exc).__name__}: {exc}"}
             print(f"[{datetime.now(UTC):%H:%M:%S}] ✗ {type(exc).__name__}: {exc}")
+
+        pulse.observe(result)
+
+        if getattr(cfg, "heartbeat_enabled", True) and await pulse.due():
+            try:
+                rows = await store.get(KEY_LAST_POSITIONS, []) or []
+                wl = await store.get(KEY_WATCHLIST, []) or []
+                text = pulse.render(cfg, rows_to_positions(rows), wl)
+            except Exception as exc:  # noqa: BLE001
+                text = pulse.render(cfg, None, None)
+                print(f"[heartbeat] ✗ تعذّر بناء التقرير: {exc}")
+            await _emit(env, text)
+            await pulse.mark_reported()
+
         elapsed = time.monotonic() - started
         await asyncio.sleep(max(1.0, interval - elapsed))
 

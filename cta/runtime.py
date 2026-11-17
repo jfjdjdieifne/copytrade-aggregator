@@ -184,6 +184,17 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
         ideas = await load_ideas(store)
         wl = await get_watchlist(store)
         positions = await collect_positions(venues, wl, cfg)
+        # Snapshot for the heartbeat. It explains silence using what this cycle
+        # already saw, so it never re-polls a venue to answer "why nothing?" —
+        # and the answer survives a restart.
+        try:
+            from .heartbeat import KEY_LAST_POSITIONS, positions_to_rows
+
+            await store.set(KEY_LAST_POSITIONS, positions_to_rows(positions))
+        except Exception:
+            # A missing snapshot costs one line of one report. It must never
+            # cost the cycle.
+            pass
 
         lifecycle_events = reconcile(
             ideas,
@@ -320,6 +331,12 @@ async def run_cycle_async(env, fetch, cfg: Optional[Config] = None) -> dict:
                             if e["kind"] in ("exit", "expired")),
         "delivered": delivered,
         "source_health": health,
+        # Everything below exists for the heartbeat: counts that move, so a
+        # report can prove the radar is working instead of claiming it.
+        "health": health,
+        "positions": len(positions),
+        "coins": sorted({str(getattr(p, "coin", "") or "")
+                         for p in positions})[:24],
     }
 
 
