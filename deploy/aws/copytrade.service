@@ -2,6 +2,12 @@
 Description=Copy-Trade Aggregator — consensus radar for proven traders
 After=network-online.target
 Wants=network-online.target
+# StartLimit* belong in [Unit]. They used to sit in [Service], where systemd
+# ignored them with a warning -- so the crash-loop guard this file exists to
+# provide was never actually armed, and a failing service would have retried
+# forever against the venues instead of stopping after five attempts.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -11,10 +17,6 @@ EnvironmentFile=__REPO_DIR__/.env
 ExecStart=__PYTHON__ -m cta.cli run --interval __INTERVAL__
 Restart=always
 RestartSec=10
-# A crash loop must not hammer the venues or burn the budget: systemd will give
-# up restarting after 5 failures in 5 minutes and leave the last error visible.
-StartLimitIntervalSec=300
-StartLimitBurst=5
 StandardOutput=journal
 StandardError=journal
 
