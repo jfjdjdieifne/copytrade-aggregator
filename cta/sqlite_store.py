@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import threading
 from typing import Any, Optional
 
@@ -46,7 +47,7 @@ class SqliteStore:
             "CREATE TABLE IF NOT EXISTS kv ("
             " key TEXT PRIMARY KEY,"
             " value TEXT NOT NULL,"
-            " updated_at REAL DEFAULT (unixepoch('subsec'))"
+            " updated_at REAL"
             ")"
         )
         self._conn.commit()
@@ -70,10 +71,10 @@ class SqliteStore:
         payload = json.dumps(value, default=str)
         with self._lock:
             self._conn.execute(
-                "INSERT INTO kv (key, value, updated_at) VALUES (?, ?, unixepoch('subsec')) "
+                "INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
                 "updated_at = excluded.updated_at",
-                (key, payload),
+                (key, payload, time.time()),
             )
             self._conn.commit()
 
