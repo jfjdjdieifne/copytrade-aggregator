@@ -243,3 +243,28 @@ def test_the_boot_message_gives_a_baseline_to_compare_against():
 def test_the_boot_message_reports_venue_failures_honestly():
     text = boot_message(health={"a": True, "b": False}, watchlist=0)
     assert "1/2" in text
+
+
+def test_new_zero_snapshot_clears_old_counts_and_coins():
+    p = Pulse(interval_min=30, now=NOW)
+    p.observe(report(watchlist=3, positions=2, coins=['BTC', 'ETH']))
+    p.observe(report(watchlist=0, positions=0, coins=[]))
+    assert p.watchlist == 0
+    assert p.positions_seen == 0
+    assert p.coins == set()
+    assert 'مراكز مرئية الآن: 0' in p.render(CFG, [], [], now=NOW)
+
+
+def test_coin_count_is_latest_snapshot_not_accumulation():
+    p = Pulse(interval_min=30, now=NOW)
+    p.observe(report(coins=['BTC', 'ETH']))
+    p.observe(report(coins=['SOL']))
+    assert p.coins == {'SOL'}
+
+
+def test_failed_cycle_does_not_erase_last_known_snapshot():
+    p = Pulse(interval_min=30, now=NOW)
+    p.observe(report(watchlist=3, positions=2, coins=['BTC']))
+    p.observe({'error': 'failed'})
+    assert (p.watchlist, p.positions_seen, p.coins) == (3, 2, {'BTC'})
+    assert p.failed == 1

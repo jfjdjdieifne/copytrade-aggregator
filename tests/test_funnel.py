@@ -35,7 +35,7 @@ def test_no_positions_at_all_points_at_the_venues():
 def test_traders_on_different_coins_is_a_quiet_market():
     pos = [mk("w1", "BTC", "LONG", 100), mk("w2", "ETH", "LONG", 100)]
     report = diagnose(pos, [{"wallet": "w1"}, {"wallet": "w2"}], CFG, now=NOW)
-    assert "السوق هادي" in report["verdict"]
+    assert "ما بيثبت إن السوق هادي" in report["verdict"]
     assert report["near_misses"] == []
 
 
@@ -82,7 +82,9 @@ def test_a_group_that_passes_every_gate_is_reported_as_ready():
     assert misses[0]["failed_gates"] == []
     assert misses[0]["n_independent"] == 3
     assert misses[0]["n_sources"] == 2
-    assert "إجماع جاهز" in diagnose(pos, [{"wallet": "w1"}, {"wallet": "w2"}], CFG, now=NOW)["verdict"]
+    verdict = diagnose(pos, [{"wallet": "w1"}, {"wallet": "w2"}], CFG, now=NOW)["verdict"]
+    assert "الفحوص الأولية فقط" in verdict
+    assert "إجماع جاهز" not in verdict
 
 
 def test_an_old_cluster_is_reported_as_stale():
@@ -136,3 +138,24 @@ def test_the_closest_miss_is_reported_first():
     misses = near_misses(close + far, CFG, now=NOW)
     assert misses[0]["coin"] == "BTC", "the nearly-ready group should come first"
     assert misses[-1]["coin"] == "ETH"
+
+
+def test_wide_diagnostic_group_does_not_hide_a_tight_pair():
+    # 100 and 100.2 agree on price. 110 must not cause the diagnostic to
+    # attribute the entire group to the price gate and hide the passing pair.
+    positions = [
+        mk('w1', 'BTC', 'LONG', 100, size=100_000),
+        mk('w2', 'BTC', 'LONG', 100.2, size=130_000),
+        mk('w3', 'BTC', 'LONG', 110, size=160_000),
+    ]
+    misses = near_misses(positions, CFG, now=NOW)
+    assert misses[0]['n_independent'] == 2
+    assert misses[0]['passed']
+    assert misses[0]['spread_bps'] < CFG.entry_tolerance_bps
+    assert any(m['n_raw'] == 3 and not m['passed'] for m in misses)
+
+
+def test_identical_tight_and_wide_groups_are_not_reported_twice():
+    positions = [mk('w1', 'BTC', 'LONG', 100, size=100_000),
+                 mk('w2', 'BTC', 'LONG', 100.2, size=130_000)]
+    assert len(near_misses(positions, CFG, now=NOW)) == 1

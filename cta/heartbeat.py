@@ -163,15 +163,14 @@ class Pulse:
         self.clusters += _int(report.get("clusters"))
         self.ideas_opened += _int(report.get("ideas_opened"))
         self.ideas_closed += _int(report.get("ideas_closed"))
-        watchlist = _int(report.get("watchlist"))
-        if watchlist:
-            self.watchlist = watchlist
-        positions = _int(report.get("positions"))
-        if positions:
-            self.positions_seen = positions
-        for coin in report.get("coins") or []:
-            if coin:
-                self.coins.add(str(coin))
+        # A real zero is a new observation, not a reason to keep stale data.
+        # Missing keys (e.g. a failed cycle) must not erase the last snapshot.
+        if report.get("watchlist") is not None:
+            self.watchlist = _int(report["watchlist"])
+        if report.get("positions") is not None:
+            self.positions_seen = _int(report["positions"])
+        if isinstance(report.get("coins"), (list, tuple, set)):
+            self.coins = {str(coin) for coin in report["coins"] if coin}
         health = report.get("health")
         if isinstance(health, dict) and health:
             self.health = {str(k): bool(v) for k, v in health.items()}

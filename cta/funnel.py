@@ -77,9 +77,20 @@ def near_misses(
         # the operator can only see if we show them the spread instead of
         # splitting them into two silent groups.
         grouping_bps = max(float(cfg.entry_tolerance_bps or 50.0) * 10.0, 1500.0)
-        for cluster in _cluster_by_price(group, grouping_bps):
+        # The wide diagnostic group must not swallow a tighter subgroup. For
+        # example, entries 100, 100.2 and 110 produce a 998 bps wide group but
+        # also a pair within 50 bps. Examine both, and deduplicate identical
+        # groups so the report remains concise.
+        groups = (_cluster_by_price(group, cfg.entry_tolerance_bps)
+                  + _cluster_by_price(group, grouping_bps))
+        seen_groups: set[tuple[int, ...]] = set()
+        for cluster in groups:
             if len(cluster) < 2:
                 continue
+            identity = tuple(sorted(id(p) for p in cluster))
+            if identity in seen_groups:
+                continue
+            seen_groups.add(identity)
             independent = enforce_independence(
                 cluster, getattr(cfg, "twin_window_sec", 30.0)
             )
@@ -179,14 +190,15 @@ def diagnose(
     elif not misses:
         verdict = (
             f"مراقب {graded} متداول و{len(wallets_with_positions)} منهم بمركز مفتوح، "
-            "بس ما في اتنين على نفس العملة والاتجاه. السوق هادي — الانتظار صح."
+            "بس ما لقينا مجموعة ضمن نطاق التشخيص؛ هاد لحاله ما بيثبت إن السوق هادي."
         )
     else:
         closest = misses[0]
         if closest["passed"]:
             verdict = (
-                f"في إجماع جاهز: {closest['coin']} {closest['side']} "
-                f"({closest['n_independent']} متداول)."
+                f"أقرب مجموعة: {closest['coin']} {closest['side']} "
+                f"({closest['n_independent']} متداول) اجتازت الفحوص الأولية فقط؛ "
+                "باقي شروط الإشارة لم تُفحص هنا."
             )
         else:
             gates = "، ".join(closest["failed_gates"])
